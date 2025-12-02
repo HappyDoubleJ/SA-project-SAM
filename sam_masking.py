@@ -439,6 +439,28 @@ class SAM2Segmenter:
 
         return str(checkpoint_path)
 
+    def _find_config_path(self) -> str:
+        """Find SAM2 config file path"""
+        try:
+            import sam2
+            sam2_path = Path(sam2.__file__).parent
+
+            # Try different possible config locations
+            possible_paths = [
+                sam2_path / "configs" / "sam2.1" / self.CONFIG_NAME,
+                sam2_path / "sam2_configs" / self.CONFIG_NAME,
+                sam2_path.parent / "configs" / "sam2.1" / self.CONFIG_NAME,
+            ]
+
+            for config_path in possible_paths:
+                if config_path.exists():
+                    return str(config_path)
+
+            # If not found, return just the name (let hydra handle it)
+            return self.CONFIG_NAME
+        except Exception:
+            return self.CONFIG_NAME
+
     def load_model(self):
         """Load SAM2 model"""
         try:
@@ -448,9 +470,35 @@ class SAM2Segmenter:
             raise ImportError("Please install SAM2: pip install git+https://github.com/facebookresearch/segment-anything-2.git")
 
         checkpoint_path = self.download_checkpoint()
+        config_path = self._find_config_path()
 
         print(f"Loading SAM2 model on {self.device}...")
-        self.model = build_sam2(self.CONFIG_NAME, checkpoint_path, device=self.device)
+        print(f"  Config: {config_path}")
+
+        try:
+            self.model = build_sam2(config_path, checkpoint_path, device=self.device)
+        except Exception as e:
+            # Fallback: try with hydra config initialization
+            print(f"  Direct config load failed, trying alternative method...")
+            import sam2
+            sam2_dir = Path(sam2.__file__).parent
+
+            # Add sam2 configs to hydra search path
+            from hydra import initialize_config_dir, compose
+            from hydra.core.global_hydra import GlobalHydra
+
+            GlobalHydra.instance().clear()
+
+            config_dir = sam2_dir / "configs" / "sam2.1"
+            if not config_dir.exists():
+                config_dir = sam2_dir / "sam2_configs"
+
+            if config_dir.exists():
+                with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+                    self.model = build_sam2(self.CONFIG_NAME, checkpoint_path, device=self.device)
+            else:
+                raise ImportError(f"Cannot find SAM2 config directory. Error: {e}")
+
         self.predictor = SAM2ImagePredictor(self.model)
         print("SAM2 model loaded successfully!")
 
@@ -575,9 +623,19 @@ class SAM2Segmenter:
 # =============================================================================
 
 class MedSAM2Segmenter:
-    """MedSAM2 for medical image segmentation (specialized for medical images)"""
+    """
+    MedSAM2 for medical image segmentation
+    Specialized for medical images, fine-tuned on medical datasets
 
-    def __init__(self, checkpoint_dir: str = "checkpoints", device: str = None):
+    Reference: https://github.com/bowang-lab/MedSAM2
+    """
+
+    # HuggingFace checkpoint URL
+    CHECKPOINT_URL = "https://huggingface.co/wanglab/MedSAM2/resolve/main/MedSAM2_latest.pt"
+    CHECKPOINT_NAME = "MedSAM2_latest.pt"
+    CONFIG_NAME = "sam2.1_hiera_t512.yaml"  # MedSAM2 uses tiny model config
+
+    def __init__(self, checkpoint_dir: str = "checkpoints", medsam2_repo_path: str = None, device: str = None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(exist_ok=True)
@@ -586,73 +644,138 @@ class MedSAM2Segmenter:
         self.feature_detector = LesionFeatureDetector()
         self._available = None
 
+        # MedSAM2 repository path (for configs)
+        self.medsam2_repo_path = Path(medsam2_repo_path) if medsam2_repo_path else None
+
+        # Try to find MedSAM2 repo in common locations
+        if self.medsam2_repo_path is None:
+            possible_paths = [
+                Path("MedSAM2"),
+                self.checkpoint_dir.parent / "MedSAM2",
+                Path("/content/MedSAM2"),  # Colab
+                Path.home() / "MedSAM2",
+            ]
+            for p in possible_paths:
+                if p.exists() and (p / "sam2").exists():
+                    self.medsam2_repo_path = p
+                    break
+
+    def _find_checkpoint(self) -> Optional[Path]:
+        """Find MedSAM2 checkpoint in various locations"""
+        possible_paths = [
+            self.checkpoint_dir / self.CHECKPOINT_NAME,
+            self.checkpoint_dir / "MedSAM2_2411.pt",
+        ]
+
+        if self.medsam2_repo_path:
+            possible_paths.extend([
+                self.medsam2_repo_path / "checkpoints" / self.CHECKPOINT_NAME,
+                self.medsam2_repo_path / "checkpoints" / "MedSAM2_2411.pt",
+            ])
+
+        for path in possible_paths:
+            if path.exists():
+                return path
+        return None
+
+    def _find_config(self) -> Optional[Path]:
+        """Find MedSAM2 config file"""
+        if self.medsam2_repo_path:
+            possible_paths = [
+                self.medsam2_repo_path / "configs" / self.CONFIG_NAME,
+                self.medsam2_repo_path / "sam2" / "configs" / "sam2.1" / "sam2.1_hiera_t.yaml",
+            ]
+            for path in possible_paths:
+                if path.exists():
+                    return path
+        return None
+
+    def download_checkpoint(self) -> str:
+        """Download MedSAM2 checkpoint from HuggingFace"""
+        checkpoint_path = self.checkpoint_dir / self.CHECKPOINT_NAME
+
+        if not checkpoint_path.exists():
+            print(f"Downloading MedSAM2 checkpoint to {checkpoint_path}...")
+            print("(This may take a few minutes, ~300MB)")
+            try:
+                urllib.request.urlretrieve(self.CHECKPOINT_URL, checkpoint_path)
+                print("Download complete!")
+            except Exception as e:
+                print(f"Download failed: {e}")
+                print("Please manually download from: https://huggingface.co/wanglab/MedSAM2")
+                raise
+
+        return str(checkpoint_path)
+
     def is_available(self) -> bool:
         """Check if MedSAM2 is available"""
         if self._available is not None:
             return self._available
 
         try:
-            # Try to import MedSAM2
-            import sys
-            medsam2_path = self.checkpoint_dir.parent / "MedSAM2"
-            if medsam2_path.exists() and str(medsam2_path) not in sys.path:
-                sys.path.insert(0, str(medsam2_path))
+            # Check if sam2 module is importable
+            from sam2.build_sam import build_sam2
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-            # Check for checkpoint
-            checkpoint_path = self.checkpoint_dir / "MedSAM2_pretrain.pth"
-            if not checkpoint_path.exists():
-                # Try alternate locations
-                alt_paths = [
-                    self.checkpoint_dir.parent / "MedSAM2" / "checkpoints" / "MedSAM2_pretrain.pth",
-                    Path("MedSAM2") / "checkpoints" / "MedSAM2_pretrain.pth",
-                ]
-                for alt in alt_paths:
-                    if alt.exists():
-                        checkpoint_path = alt
-                        break
+            # Check for checkpoint (or ability to download)
+            checkpoint = self._find_checkpoint()
+            if checkpoint is None:
+                # We can download it
+                self._available = True
+            else:
+                self._available = True
 
-            self._available = checkpoint_path.exists()
-        except Exception:
+        except ImportError:
+            print("SAM2 module not found. Please install: pip install git+https://github.com/facebookresearch/segment-anything-2.git")
+            self._available = False
+        except Exception as e:
+            print(f"MedSAM2 availability check failed: {e}")
             self._available = False
 
         return self._available
 
     def load_model(self):
         """Load MedSAM2 model"""
-        if not self.is_available():
-            raise ImportError(
-                "MedSAM2 not available. Please install from: https://github.com/bowang-lab/MedSAM2\n"
-                "1. git clone https://github.com/bowang-lab/MedSAM2.git\n"
-                "2. cd MedSAM2 && pip install -e .\n"
-                "3. bash download.sh"
-            )
-
-        # This is a placeholder - actual implementation depends on MedSAM2's API
-        # You'll need to adjust based on MedSAM2's actual usage
         try:
             from sam2.build_sam import build_sam2
             from sam2.sam2_image_predictor import SAM2ImagePredictor
+        except ImportError:
+            raise ImportError(
+                "SAM2 not installed. Please install:\n"
+                "pip install git+https://github.com/facebookresearch/segment-anything-2.git"
+            )
 
-            checkpoint_path = None
-            for path in [
-                self.checkpoint_dir / "MedSAM2_pretrain.pth",
-                self.checkpoint_dir.parent / "MedSAM2" / "checkpoints" / "MedSAM2_pretrain.pth",
-            ]:
-                if path.exists():
-                    checkpoint_path = path
-                    break
+        # Find or download checkpoint
+        checkpoint_path = self._find_checkpoint()
+        if checkpoint_path is None:
+            checkpoint_path = Path(self.download_checkpoint())
 
-            if checkpoint_path is None:
-                raise FileNotFoundError("MedSAM2 checkpoint not found")
+        # Find config or use default
+        config_path = self._find_config()
 
-            print(f"Loading MedSAM2 model on {self.device}...")
-            # MedSAM2 uses SAM2 architecture with medical fine-tuning
-            self.model = build_sam2("sam2.1_hiera_l.yaml", str(checkpoint_path), device=self.device)
+        print(f"Loading MedSAM2 model on {self.device}...")
+        print(f"  Checkpoint: {checkpoint_path}")
+
+        try:
+            if config_path:
+                print(f"  Config: {config_path}")
+                self.model = build_sam2(str(config_path), str(checkpoint_path), device=self.device)
+            else:
+                # Use default SAM2 config (will work but may not be optimal)
+                print("  Config: Using default sam2.1_hiera_t.yaml")
+                self.model = build_sam2("sam2.1_hiera_t.yaml", str(checkpoint_path), device=self.device)
+
             self.predictor = SAM2ImagePredictor(self.model)
             print("MedSAM2 model loaded successfully!")
 
         except Exception as e:
-            raise ImportError(f"Failed to load MedSAM2: {e}")
+            raise ImportError(
+                f"Failed to load MedSAM2: {e}\n\n"
+                "Please ensure MedSAM2 is properly installed:\n"
+                "1. git clone https://github.com/bowang-lab/MedSAM2.git\n"
+                "2. cd MedSAM2 && pip install -e .\n"
+                "3. bash download.sh"
+            )
 
     def segment_with_point(self, image: np.ndarray,
                            point: Tuple[int, int]) -> Tuple[np.ndarray, float]:
@@ -663,13 +786,18 @@ class MedSAM2Segmenter:
         with torch.inference_mode():
             self.predictor.set_image(image)
             masks, scores, _ = self.predictor.predict(
-                point_coords=np.array([[point[0], point[1]]]),
-                point_labels=np.array([1]),
-                multimask_output=True,
+                point_coords=np.array([[point[0], point[1]]], dtype=np.float32),
+                point_labels=np.array([1], dtype=np.int32),
+                multimask_output=False,  # MedSAM2 style: single mask
             )
 
-        best_idx = np.argmax(scores)
-        return masks[best_idx], float(scores[best_idx])
+        # Handle both single and multi-mask output
+        if len(masks.shape) == 4:
+            masks = masks.squeeze(0)
+        if len(scores.shape) > 0:
+            best_idx = np.argmax(scores)
+            return masks[best_idx], float(scores[best_idx])
+        return masks[0], float(scores)
 
     def segment_with_box(self, image: np.ndarray,
                          box: Tuple[int, int, int, int]) -> Tuple[np.ndarray, float]:
@@ -680,12 +808,18 @@ class MedSAM2Segmenter:
         with torch.inference_mode():
             self.predictor.set_image(image)
             masks, scores, _ = self.predictor.predict(
-                box=np.array(box),
-                multimask_output=True,
+                point_coords=None,
+                point_labels=None,
+                box=np.array(box, dtype=np.float32)[None, :],  # Add batch dim
+                multimask_output=False,
             )
 
-        best_idx = np.argmax(scores)
-        return masks[best_idx], float(scores[best_idx])
+        if len(masks.shape) == 4:
+            masks = masks.squeeze(0)
+        if len(scores.shape) > 0:
+            best_idx = np.argmax(scores)
+            return masks[best_idx], float(scores[best_idx])
+        return masks[0], float(scores)
 
     def segment_center_focused(self, image: np.ndarray) -> Dict[str, Any]:
         """Strategy 1: Center-focused segmentation"""
