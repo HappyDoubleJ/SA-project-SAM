@@ -439,6 +439,28 @@ class SAM2Segmenter:
 
         return str(checkpoint_path)
 
+    def _find_config_path(self) -> str:
+        """Find SAM2 config file path"""
+        try:
+            import sam2
+            sam2_path = Path(sam2.__file__).parent
+
+            # Try different possible config locations
+            possible_paths = [
+                sam2_path / "configs" / "sam2.1" / self.CONFIG_NAME,
+                sam2_path / "sam2_configs" / self.CONFIG_NAME,
+                sam2_path.parent / "configs" / "sam2.1" / self.CONFIG_NAME,
+            ]
+
+            for config_path in possible_paths:
+                if config_path.exists():
+                    return str(config_path)
+
+            # If not found, return just the name (let hydra handle it)
+            return self.CONFIG_NAME
+        except Exception:
+            return self.CONFIG_NAME
+
     def load_model(self):
         """Load SAM2 model"""
         try:
@@ -448,9 +470,35 @@ class SAM2Segmenter:
             raise ImportError("Please install SAM2: pip install git+https://github.com/facebookresearch/segment-anything-2.git")
 
         checkpoint_path = self.download_checkpoint()
+        config_path = self._find_config_path()
 
         print(f"Loading SAM2 model on {self.device}...")
-        self.model = build_sam2(self.CONFIG_NAME, checkpoint_path, device=self.device)
+        print(f"  Config: {config_path}")
+
+        try:
+            self.model = build_sam2(config_path, checkpoint_path, device=self.device)
+        except Exception as e:
+            # Fallback: try with hydra config initialization
+            print(f"  Direct config load failed, trying alternative method...")
+            import sam2
+            sam2_dir = Path(sam2.__file__).parent
+
+            # Add sam2 configs to hydra search path
+            from hydra import initialize_config_dir, compose
+            from hydra.core.global_hydra import GlobalHydra
+
+            GlobalHydra.instance().clear()
+
+            config_dir = sam2_dir / "configs" / "sam2.1"
+            if not config_dir.exists():
+                config_dir = sam2_dir / "sam2_configs"
+
+            if config_dir.exists():
+                with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+                    self.model = build_sam2(self.CONFIG_NAME, checkpoint_path, device=self.device)
+            else:
+                raise ImportError(f"Cannot find SAM2 config directory. Error: {e}")
+
         self.predictor = SAM2ImagePredictor(self.model)
         print("SAM2 model loaded successfully!")
 
