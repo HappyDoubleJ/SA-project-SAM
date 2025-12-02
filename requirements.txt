@@ -1,0 +1,23 @@
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+matplotlib>=3.7.0
+
+# SAM (Segment Anything Model)
+segment-anything @ git+https://github.com/facebookresearch/segment-anything.git
+
+# OpenAI
+openai>=1.0.0
+
+# Environment management
+python-dotenv>=1.0.0
+
+# Utilities
+tqdm>=4.65.0
+requests>=2.31.0
+
+# Image processing
+scikit-image>=0.21.0
