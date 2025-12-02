@@ -9,10 +9,11 @@ matplotlib>=3.7.0
 # SAM (Segment Anything Model)
 segment-anything @ git+https://github.com/facebookresearch/segment-anything.git
 
+# SAM2 (install separately)
+# pip install git+https://github.com/facebookresearch/segment-anything-2.git
+
 # MedSAM2 (Medical image segmentation)
-# Note: MedSAM2 requires manual setup from https://github.com/bowang-lab/MedSAM2
-# SAM2 base - install manually: pip install git+https://github.com/facebookresearch/segment-anything-2.git
-sam-2>=1.1.0
+# Manual setup required: https://github.com/bowang-lab/MedSAM2
 
 # OpenAI
 openai>=1.0.0
