@@ -1,5 +1,9 @@
 """
 SAM and MedSAM2 Masking Pipeline for Skin Disease Detection
+
+Two segmentation strategies:
+1. Center-focused: Assumes lesion is near image center
+2. Lesion-feature-based: Detects based on color changes and texture/elevation
 """
 
 import os
@@ -10,7 +14,213 @@ from PIL import Image
 from typing import Optional, Tuple, List, Dict, Any
 import urllib.request
 from pathlib import Path
+from scipy import ndimage
+from skimage import color, filters, morphology
 
+
+# =============================================================================
+# Lesion Feature Detection (Color + Texture/Elevation)
+# =============================================================================
+
+class LesionFeatureDetector:
+    """Detect potential lesion areas based on skin disease characteristics"""
+
+    def __init__(self):
+        pass
+
+    def detect_color_anomalies(self, image: np.ndarray) -> np.ndarray:
+        """
+        Detect areas with abnormal color compared to surrounding skin
+
+        Skin lesions often show:
+        - Redness (erythema)
+        - Brown/black pigmentation
+        - White depigmentation
+        - Yellow/purple discoloration
+        """
+        # Convert to LAB color space (better for skin color analysis)
+        lab = color.rgb2lab(image)
+        l_channel = lab[:, :, 0]  # Lightness
+        a_channel = lab[:, :, 1]  # Green-Red
+        b_channel = lab[:, :, 2]  # Blue-Yellow
+
+        # Also use HSV for saturation analysis
+        hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+        h_channel = hsv[:, :, 0]
+        s_channel = hsv[:, :, 1]
+        v_channel = hsv[:, :, 2]
+
+        # Detect color deviations from local mean (potential lesion areas)
+        kernel_size = max(image.shape[0], image.shape[1]) // 8
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        kernel_size = max(kernel_size, 15)
+
+        # Local mean subtraction to find color anomalies
+        l_local_mean = cv2.GaussianBlur(l_channel, (kernel_size, kernel_size), 0)
+        a_local_mean = cv2.GaussianBlur(a_channel, (kernel_size, kernel_size), 0)
+        b_local_mean = cv2.GaussianBlur(b_channel, (kernel_size, kernel_size), 0)
+
+        # Color deviation map
+        l_diff = np.abs(l_channel - l_local_mean)
+        a_diff = np.abs(a_channel - a_local_mean)
+        b_diff = np.abs(b_channel - b_local_mean)
+
+        # Combined color anomaly score
+        color_anomaly = (l_diff / 50.0 + a_diff / 30.0 + b_diff / 30.0) / 3.0
+
+        # Detect high saturation areas (often indicates lesions)
+        s_normalized = s_channel.astype(float) / 255.0
+        high_saturation = s_normalized > 0.3
+
+        # Detect redness (high a* in LAB)
+        redness = (a_channel > 10).astype(float)
+
+        # Combine all features
+        combined = color_anomaly + 0.3 * high_saturation.astype(float) + 0.2 * redness
+        combined = np.clip(combined, 0, 1)
+
+        # Normalize to 0-1
+        if combined.max() > combined.min():
+            combined = (combined - combined.min()) / (combined.max() - combined.min())
+
+        return combined
+
+    def detect_texture_elevation(self, image: np.ndarray) -> np.ndarray:
+        """
+        Detect areas with texture changes indicating elevation/depression
+
+        Uses gradient and edge information to detect:
+        - Raised lesions (papules, nodules)
+        - Depressed lesions (atrophy, ulcers)
+        - Textural changes (scaling, roughness)
+        """
+        # Convert to grayscale
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY).astype(float)
+        else:
+            gray = image.astype(float)
+
+        # Compute gradient magnitude (indicates edges/elevation changes)
+        sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        gradient_mag = np.sqrt(sobel_x**2 + sobel_y**2)
+
+        # Laplacian for detecting elevation changes
+        laplacian = np.abs(cv2.Laplacian(gray, cv2.CV_64F))
+
+        # Local texture variance (indicates rough/scaly areas)
+        kernel_size = 11
+        local_mean = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
+        local_sq_mean = cv2.GaussianBlur(gray**2, (kernel_size, kernel_size), 0)
+        local_variance = local_sq_mean - local_mean**2
+        local_variance = np.clip(local_variance, 0, None)
+
+        # Normalize each feature
+        def normalize(x):
+            if x.max() > x.min():
+                return (x - x.min()) / (x.max() - x.min())
+            return x
+
+        gradient_norm = normalize(gradient_mag)
+        laplacian_norm = normalize(laplacian)
+        variance_norm = normalize(local_variance)
+
+        # Combined texture/elevation score
+        texture_score = 0.4 * gradient_norm + 0.3 * laplacian_norm + 0.3 * variance_norm
+
+        return texture_score
+
+    def get_lesion_candidate_points(self, image: np.ndarray,
+                                     n_points: int = 5) -> List[Tuple[int, int]]:
+        """
+        Get candidate points for lesion location based on features
+
+        Returns list of (x, y) points sorted by likelihood
+        """
+        color_map = self.detect_color_anomalies(image)
+        texture_map = self.detect_texture_elevation(image)
+
+        # Combined score (color is usually more reliable)
+        combined = 0.6 * color_map + 0.4 * texture_map
+
+        # Apply center bias (lesions often centered in clinical photos)
+        h, w = combined.shape
+        y_grid, x_grid = np.ogrid[:h, :w]
+        center_y, center_x = h // 2, w // 2
+        distance_from_center = np.sqrt((x_grid - center_x)**2 + (y_grid - center_y)**2)
+        max_dist = np.sqrt(center_x**2 + center_y**2)
+        center_weight = 1.0 - 0.3 * (distance_from_center / max_dist)
+
+        combined_weighted = combined * center_weight
+
+        # Find local maxima
+        # Smooth first to avoid too many peaks
+        smoothed = cv2.GaussianBlur(combined_weighted, (21, 21), 0)
+
+        # Find top N points
+        points = []
+        temp = smoothed.copy()
+        min_distance = min(h, w) // 10
+
+        for _ in range(n_points):
+            max_idx = np.unravel_index(np.argmax(temp), temp.shape)
+            y, x = max_idx
+            points.append((int(x), int(y)))
+
+            # Suppress nearby area
+            y_min = max(0, y - min_distance)
+            y_max = min(h, y + min_distance)
+            x_min = max(0, x - min_distance)
+            x_max = min(w, x + min_distance)
+            temp[y_min:y_max, x_min:x_max] = 0
+
+        return points
+
+    def get_lesion_bounding_box(self, image: np.ndarray,
+                                 threshold: float = 0.3) -> Tuple[int, int, int, int]:
+        """
+        Get bounding box around detected lesion area
+
+        Returns (x1, y1, x2, y2)
+        """
+        color_map = self.detect_color_anomalies(image)
+        texture_map = self.detect_texture_elevation(image)
+        combined = 0.6 * color_map + 0.4 * texture_map
+
+        # Threshold to get binary mask
+        binary = combined > threshold
+
+        # Clean up with morphology
+        binary = morphology.binary_opening(binary, morphology.disk(3))
+        binary = morphology.binary_closing(binary, morphology.disk(5))
+
+        # Find bounding box
+        if not binary.any():
+            # Fallback to center region
+            h, w = image.shape[:2]
+            margin = 0.1
+            return (int(w * margin), int(h * margin),
+                    int(w * (1 - margin)), int(h * (1 - margin)))
+
+        y_indices, x_indices = np.where(binary)
+        x1, x2 = x_indices.min(), x_indices.max()
+        y1, y2 = y_indices.min(), y_indices.max()
+
+        # Add padding
+        h, w = image.shape[:2]
+        padding = 20
+        x1 = max(0, x1 - padding)
+        y1 = max(0, y1 - padding)
+        x2 = min(w, x2 + padding)
+        y2 = min(h, y2 + padding)
+
+        return (x1, y1, x2, y2)
+
+
+# =============================================================================
+# SAM Segmenter
+# =============================================================================
 
 class SAMSegmenter:
     """Standard SAM (Segment Anything Model) for skin lesion segmentation"""
@@ -25,6 +235,7 @@ class SAMSegmenter:
         self.model = None
         self.predictor = None
         self.mask_generator = None
+        self.feature_detector = LesionFeatureDetector()
 
     def download_checkpoint(self) -> str:
         """Download SAM checkpoint if not exists"""
@@ -62,47 +273,14 @@ class SAMSegmenter:
         )
         print("SAM model loaded successfully!")
 
-    def segment_auto(self, image: np.ndarray) -> List[Dict[str, Any]]:
-        """
-        Automatic segmentation - finds all possible masks
-
-        Args:
-            image: RGB image as numpy array (H, W, 3)
-
-        Returns:
-            List of mask dictionaries sorted by area (largest first)
-        """
-        if self.mask_generator is None:
-            self.load_model()
-
-        masks = self.mask_generator.generate(image)
-        # Sort by area (largest first)
-        masks = sorted(masks, key=lambda x: x['area'], reverse=True)
-        return masks
-
     def segment_with_point(self, image: np.ndarray,
-                           point: Tuple[int, int] = None,
+                           point: Tuple[int, int],
                            point_label: int = 1) -> Tuple[np.ndarray, float]:
-        """
-        Segment with a point prompt
-
-        Args:
-            image: RGB image as numpy array (H, W, 3)
-            point: (x, y) point coordinate. If None, uses center of image
-            point_label: 1 for foreground, 0 for background
-
-        Returns:
-            Tuple of (mask, confidence_score)
-        """
+        """Segment with a point prompt"""
         if self.predictor is None:
             self.load_model()
 
         self.predictor.set_image(image)
-
-        if point is None:
-            # Use center of image as default
-            h, w = image.shape[:2]
-            point = (w // 2, h // 2)
 
         input_point = np.array([[point[0], point[1]]])
         input_label = np.array([point_label])
@@ -113,34 +291,16 @@ class SAMSegmenter:
             multimask_output=True,
         )
 
-        # Return the mask with highest score
         best_idx = np.argmax(scores)
         return masks[best_idx], scores[best_idx]
 
     def segment_with_box(self, image: np.ndarray,
-                         box: Tuple[int, int, int, int] = None) -> Tuple[np.ndarray, float]:
-        """
-        Segment with a bounding box prompt
-
-        Args:
-            image: RGB image as numpy array (H, W, 3)
-            box: (x1, y1, x2, y2) bounding box. If None, uses 10% margin from edges
-
-        Returns:
-            Tuple of (mask, confidence_score)
-        """
+                         box: Tuple[int, int, int, int]) -> Tuple[np.ndarray, float]:
+        """Segment with a bounding box prompt"""
         if self.predictor is None:
             self.load_model()
 
         self.predictor.set_image(image)
-
-        if box is None:
-            # Use 10% margin from edges as default box
-            h, w = image.shape[:2]
-            margin_x = int(w * 0.1)
-            margin_y = int(h * 0.1)
-            box = (margin_x, margin_y, w - margin_x, h - margin_y)
-
         input_box = np.array([box])
 
         masks, scores, logits = self.predictor.predict(
@@ -151,77 +311,114 @@ class SAMSegmenter:
         best_idx = np.argmax(scores)
         return masks[best_idx], scores[best_idx]
 
-    def get_best_lesion_mask(self, image: np.ndarray,
-                             use_center_bias: bool = True) -> Tuple[np.ndarray, float, str]:
+    def segment_center_focused(self, image: np.ndarray) -> Dict[str, Any]:
         """
-        Get the best mask for skin lesion using multiple strategies
-
-        Args:
-            image: RGB image as numpy array (H, W, 3)
-            use_center_bias: Prefer masks near center (lesions usually centered)
-
-        Returns:
-            Tuple of (mask, confidence_score, method_used)
+        Strategy 1: Center-focused segmentation
+        Assumes the lesion is near the center of the image
         """
         h, w = image.shape[:2]
         center = (w // 2, h // 2)
 
-        results = []
-
         # Try center point
+        mask, score = self.segment_with_point(image, center)
+
+        # Also try with center bounding box
+        margin = 0.15
+        box = (int(w * margin), int(h * margin),
+               int(w * (1 - margin)), int(h * (1 - margin)))
+        mask_box, score_box = self.segment_with_box(image, box)
+
+        # Return better result
+        if score_box > score:
+            return {
+                'mask': mask_box,
+                'score': float(score_box),
+                'method': 'center_box',
+                'prompt': box
+            }
+        else:
+            return {
+                'mask': mask,
+                'score': float(score),
+                'method': 'center_point',
+                'prompt': center
+            }
+
+    def segment_lesion_features(self, image: np.ndarray) -> Dict[str, Any]:
+        """
+        Strategy 2: Lesion-feature-based segmentation
+        Detects lesion based on color and texture/elevation changes
+        """
+        # Get candidate points from feature analysis
+        candidate_points = self.feature_detector.get_lesion_candidate_points(image, n_points=3)
+
+        # Get bounding box from feature analysis
+        feature_box = self.feature_detector.get_lesion_bounding_box(image)
+
+        best_mask = None
+        best_score = 0
+        best_method = None
+        best_prompt = None
+
+        # Try each candidate point
+        for i, point in enumerate(candidate_points):
+            try:
+                mask, score = self.segment_with_point(image, point)
+                if score > best_score:
+                    best_mask = mask
+                    best_score = score
+                    best_method = f'feature_point_{i}'
+                    best_prompt = point
+            except Exception:
+                continue
+
+        # Try feature-based bounding box
         try:
-            mask, score = self.segment_with_point(image, center)
-            results.append((mask, score, "center_point"))
-        except Exception as e:
-            print(f"Center point failed: {e}")
+            mask_box, score_box = self.segment_with_box(image, feature_box)
+            if score_box > best_score:
+                best_mask = mask_box
+                best_score = score_box
+                best_method = 'feature_box'
+                best_prompt = feature_box
+        except Exception:
+            pass
 
-        # Try bounding box
-        try:
-            mask, score = self.segment_with_box(image)
-            results.append((mask, score, "bounding_box"))
-        except Exception as e:
-            print(f"Bounding box failed: {e}")
+        if best_mask is None:
+            # Fallback to center
+            return self.segment_center_focused(image)
 
-        # Try automatic and select best
-        try:
-            auto_masks = self.segment_auto(image)
-            if auto_masks:
-                # Filter masks that are too small or too large
-                img_area = h * w
-                valid_masks = [m for m in auto_masks
-                              if 0.01 * img_area < m['area'] < 0.9 * img_area]
+        return {
+            'mask': best_mask,
+            'score': float(best_score),
+            'method': best_method,
+            'prompt': best_prompt
+        }
 
-                if valid_masks and use_center_bias:
-                    # Prefer masks whose centroid is near center
-                    def center_distance(mask_dict):
-                        mask = mask_dict['segmentation']
-                        y_coords, x_coords = np.where(mask)
-                        if len(x_coords) == 0:
-                            return float('inf')
-                        centroid = (np.mean(x_coords), np.mean(y_coords))
-                        return np.sqrt((centroid[0] - center[0])**2 + (centroid[1] - center[1])**2)
+    def segment_both_strategies(self, image: np.ndarray) -> Dict[str, Dict[str, Any]]:
+        """
+        Run both segmentation strategies and return both results
+        """
+        results = {}
 
-                    valid_masks = sorted(valid_masks, key=center_distance)
+        print("    - Center-focused segmentation...")
+        results['center_focused'] = self.segment_center_focused(image)
 
-                if valid_masks:
-                    best_auto = valid_masks[0]
-                    results.append((best_auto['segmentation'],
-                                  best_auto['predicted_iou'],
-                                  "auto_center_biased" if use_center_bias else "auto"))
-        except Exception as e:
-            print(f"Auto segmentation failed: {e}")
+        print("    - Lesion-feature-based segmentation...")
+        results['lesion_features'] = self.segment_lesion_features(image)
 
-        if not results:
-            # Return empty mask if all methods failed
-            return np.zeros((h, w), dtype=bool), 0.0, "failed"
-
-        # Return result with highest score
-        best = max(results, key=lambda x: x[1])
-        return best
+        return results
 
 
-class MedSAM2Segmenter:
-    """MedSAM2 for medical image segmentation (specialized for medical images)"""
+# =============================================================================
+# SAM2 Segmenter
+# =============================================================================
+
+class SAM2Segmenter:
+    """SAM2 (Segment Anything Model 2) for segmentation"""
+
+    CHECKPOINT_URL = "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt"
+    CHECKPOINT_NAME = "sam2.1_hiera_large.pt"
+    CONFIG_NAME = "sam2.1_hiera_l.yaml"
 
     def __init__(self, checkpoint_dir: str = "checkpoints", device: str = None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -229,97 +426,39 @@ class MedSAM2Segmenter:
         self.checkpoint_dir.mkdir(exist_ok=True)
         self.model = None
         self.predictor = None
+        self.feature_detector = LesionFeatureDetector()
+
+    def download_checkpoint(self) -> str:
+        """Download SAM2 checkpoint if not exists"""
+        checkpoint_path = self.checkpoint_dir / self.CHECKPOINT_NAME
+
+        if not checkpoint_path.exists():
+            print(f"Downloading SAM2 checkpoint to {checkpoint_path}...")
+            urllib.request.urlretrieve(self.CHECKPOINT_URL, checkpoint_path)
+            print("Download complete!")
+
+        return str(checkpoint_path)
 
     def load_model(self):
-        """Load MedSAM2 model"""
+        """Load SAM2 model"""
         try:
-            # Try to import MedSAM2
-            # MedSAM2 uses SAM2 architecture
             from sam2.build_sam import build_sam2
             from sam2.sam2_image_predictor import SAM2ImagePredictor
-
-            # Check for MedSAM2 checkpoint
-            medsam2_checkpoint = self.checkpoint_dir / "medsam2_checkpoint.pth"
-
-            if not medsam2_checkpoint.exists():
-                print("MedSAM2 checkpoint not found.")
-                print("Please download from: https://github.com/bowang-lab/MedSAM")
-                print("Using SAM2 base model as fallback...")
-
-                # Use SAM2 base model
-                sam2_checkpoint = self.checkpoint_dir / "sam2_hiera_large.pt"
-                sam2_config = "sam2_hiera_l.yaml"
-
-                if not sam2_checkpoint.exists():
-                    print(f"Downloading SAM2 checkpoint...")
-                    url = "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt"
-                    urllib.request.urlretrieve(url, sam2_checkpoint)
-
-                self.model = build_sam2(sam2_config, str(sam2_checkpoint), device=self.device)
-            else:
-                # Load MedSAM2 specific model
-                self.model = build_sam2("sam2_hiera_l.yaml", str(medsam2_checkpoint), device=self.device)
-
-            self.predictor = SAM2ImagePredictor(self.model)
-            print("MedSAM2/SAM2 model loaded successfully!")
-
         except ImportError:
-            print("SAM2 not installed. Installing...")
-            print("Please run: pip install git+https://github.com/facebookresearch/segment-anything-2.git")
-            raise ImportError("SAM2 package required for MedSAM2")
+            raise ImportError("Please install SAM2: pip install git+https://github.com/facebookresearch/segment-anything-2.git")
 
-    def segment_with_box(self, image: np.ndarray,
-                         box: Tuple[int, int, int, int] = None) -> Tuple[np.ndarray, float]:
-        """
-        Segment with a bounding box prompt (recommended for MedSAM2)
+        checkpoint_path = self.download_checkpoint()
 
-        Args:
-            image: RGB image as numpy array (H, W, 3)
-            box: (x1, y1, x2, y2) bounding box
-
-        Returns:
-            Tuple of (mask, confidence_score)
-        """
-        if self.predictor is None:
-            self.load_model()
-
-        h, w = image.shape[:2]
-
-        if box is None:
-            margin_x = int(w * 0.1)
-            margin_y = int(h * 0.1)
-            box = (margin_x, margin_y, w - margin_x, h - margin_y)
-
-        with torch.inference_mode():
-            self.predictor.set_image(image)
-
-            masks, scores, _ = self.predictor.predict(
-                box=np.array(box),
-                multimask_output=True,
-            )
-
-        best_idx = np.argmax(scores)
-        return masks[best_idx], scores[best_idx]
+        print(f"Loading SAM2 model on {self.device}...")
+        self.model = build_sam2(self.CONFIG_NAME, checkpoint_path, device=self.device)
+        self.predictor = SAM2ImagePredictor(self.model)
+        print("SAM2 model loaded successfully!")
 
     def segment_with_point(self, image: np.ndarray,
-                           point: Tuple[int, int] = None) -> Tuple[np.ndarray, float]:
-        """
-        Segment with a point prompt
-
-        Args:
-            image: RGB image as numpy array (H, W, 3)
-            point: (x, y) point coordinate
-
-        Returns:
-            Tuple of (mask, confidence_score)
-        """
+                           point: Tuple[int, int]) -> Tuple[np.ndarray, float]:
+        """Segment with a point prompt"""
         if self.predictor is None:
             self.load_model()
-
-        h, w = image.shape[:2]
-
-        if point is None:
-            point = (w // 2, h // 2)
 
         with torch.inference_mode():
             self.predictor.set_image(image)
@@ -331,24 +470,312 @@ class MedSAM2Segmenter:
             )
 
         best_idx = np.argmax(scores)
-        return masks[best_idx], scores[best_idx]
+        return masks[best_idx], float(scores[best_idx])
 
+    def segment_with_box(self, image: np.ndarray,
+                         box: Tuple[int, int, int, int]) -> Tuple[np.ndarray, float]:
+        """Segment with a bounding box prompt"""
+        if self.predictor is None:
+            self.load_model()
+
+        with torch.inference_mode():
+            self.predictor.set_image(image)
+
+            masks, scores, _ = self.predictor.predict(
+                box=np.array(box),
+                multimask_output=True,
+            )
+
+        best_idx = np.argmax(scores)
+        return masks[best_idx], float(scores[best_idx])
+
+    def segment_center_focused(self, image: np.ndarray) -> Dict[str, Any]:
+        """Strategy 1: Center-focused segmentation"""
+        h, w = image.shape[:2]
+        center = (w // 2, h // 2)
+
+        mask, score = self.segment_with_point(image, center)
+
+        margin = 0.15
+        box = (int(w * margin), int(h * margin),
+               int(w * (1 - margin)), int(h * (1 - margin)))
+        mask_box, score_box = self.segment_with_box(image, box)
+
+        if score_box > score:
+            return {
+                'mask': mask_box,
+                'score': float(score_box),
+                'method': 'center_box',
+                'prompt': box
+            }
+        else:
+            return {
+                'mask': mask,
+                'score': float(score),
+                'method': 'center_point',
+                'prompt': center
+            }
+
+    def segment_lesion_features(self, image: np.ndarray) -> Dict[str, Any]:
+        """Strategy 2: Lesion-feature-based segmentation"""
+        candidate_points = self.feature_detector.get_lesion_candidate_points(image, n_points=3)
+        feature_box = self.feature_detector.get_lesion_bounding_box(image)
+
+        best_mask = None
+        best_score = 0
+        best_method = None
+        best_prompt = None
+
+        for i, point in enumerate(candidate_points):
+            try:
+                mask, score = self.segment_with_point(image, point)
+                if score > best_score:
+                    best_mask = mask
+                    best_score = score
+                    best_method = f'feature_point_{i}'
+                    best_prompt = point
+            except Exception:
+                continue
+
+        try:
+            mask_box, score_box = self.segment_with_box(image, feature_box)
+            if score_box > best_score:
+                best_mask = mask_box
+                best_score = score_box
+                best_method = 'feature_box'
+                best_prompt = feature_box
+        except Exception:
+            pass
+
+        if best_mask is None:
+            return self.segment_center_focused(image)
+
+        return {
+            'mask': best_mask,
+            'score': float(best_score),
+            'method': best_method,
+            'prompt': best_prompt
+        }
+
+    def segment_both_strategies(self, image: np.ndarray) -> Dict[str, Dict[str, Any]]:
+        """Run both segmentation strategies"""
+        results = {}
+
+        print("    - Center-focused segmentation...")
+        results['center_focused'] = self.segment_center_focused(image)
+
+        print("    - Lesion-feature-based segmentation...")
+        results['lesion_features'] = self.segment_lesion_features(image)
+
+        return results
+
+
+# =============================================================================
+# MedSAM2 Segmenter
+# =============================================================================
+
+class MedSAM2Segmenter:
+    """MedSAM2 for medical image segmentation (specialized for medical images)"""
+
+    def __init__(self, checkpoint_dir: str = "checkpoints", device: str = None):
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.checkpoint_dir.mkdir(exist_ok=True)
+        self.model = None
+        self.predictor = None
+        self.feature_detector = LesionFeatureDetector()
+        self._available = None
+
+    def is_available(self) -> bool:
+        """Check if MedSAM2 is available"""
+        if self._available is not None:
+            return self._available
+
+        try:
+            # Try to import MedSAM2
+            import sys
+            medsam2_path = self.checkpoint_dir.parent / "MedSAM2"
+            if medsam2_path.exists() and str(medsam2_path) not in sys.path:
+                sys.path.insert(0, str(medsam2_path))
+
+            # Check for checkpoint
+            checkpoint_path = self.checkpoint_dir / "MedSAM2_pretrain.pth"
+            if not checkpoint_path.exists():
+                # Try alternate locations
+                alt_paths = [
+                    self.checkpoint_dir.parent / "MedSAM2" / "checkpoints" / "MedSAM2_pretrain.pth",
+                    Path("MedSAM2") / "checkpoints" / "MedSAM2_pretrain.pth",
+                ]
+                for alt in alt_paths:
+                    if alt.exists():
+                        checkpoint_path = alt
+                        break
+
+            self._available = checkpoint_path.exists()
+        except Exception:
+            self._available = False
+
+        return self._available
+
+    def load_model(self):
+        """Load MedSAM2 model"""
+        if not self.is_available():
+            raise ImportError(
+                "MedSAM2 not available. Please install from: https://github.com/bowang-lab/MedSAM2\n"
+                "1. git clone https://github.com/bowang-lab/MedSAM2.git\n"
+                "2. cd MedSAM2 && pip install -e .\n"
+                "3. bash download.sh"
+            )
+
+        # This is a placeholder - actual implementation depends on MedSAM2's API
+        # You'll need to adjust based on MedSAM2's actual usage
+        try:
+            from sam2.build_sam import build_sam2
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+            checkpoint_path = None
+            for path in [
+                self.checkpoint_dir / "MedSAM2_pretrain.pth",
+                self.checkpoint_dir.parent / "MedSAM2" / "checkpoints" / "MedSAM2_pretrain.pth",
+            ]:
+                if path.exists():
+                    checkpoint_path = path
+                    break
+
+            if checkpoint_path is None:
+                raise FileNotFoundError("MedSAM2 checkpoint not found")
+
+            print(f"Loading MedSAM2 model on {self.device}...")
+            # MedSAM2 uses SAM2 architecture with medical fine-tuning
+            self.model = build_sam2("sam2.1_hiera_l.yaml", str(checkpoint_path), device=self.device)
+            self.predictor = SAM2ImagePredictor(self.model)
+            print("MedSAM2 model loaded successfully!")
+
+        except Exception as e:
+            raise ImportError(f"Failed to load MedSAM2: {e}")
+
+    def segment_with_point(self, image: np.ndarray,
+                           point: Tuple[int, int]) -> Tuple[np.ndarray, float]:
+        """Segment with a point prompt"""
+        if self.predictor is None:
+            self.load_model()
+
+        with torch.inference_mode():
+            self.predictor.set_image(image)
+            masks, scores, _ = self.predictor.predict(
+                point_coords=np.array([[point[0], point[1]]]),
+                point_labels=np.array([1]),
+                multimask_output=True,
+            )
+
+        best_idx = np.argmax(scores)
+        return masks[best_idx], float(scores[best_idx])
+
+    def segment_with_box(self, image: np.ndarray,
+                         box: Tuple[int, int, int, int]) -> Tuple[np.ndarray, float]:
+        """Segment with a bounding box prompt"""
+        if self.predictor is None:
+            self.load_model()
+
+        with torch.inference_mode():
+            self.predictor.set_image(image)
+            masks, scores, _ = self.predictor.predict(
+                box=np.array(box),
+                multimask_output=True,
+            )
+
+        best_idx = np.argmax(scores)
+        return masks[best_idx], float(scores[best_idx])
+
+    def segment_center_focused(self, image: np.ndarray) -> Dict[str, Any]:
+        """Strategy 1: Center-focused segmentation"""
+        h, w = image.shape[:2]
+        center = (w // 2, h // 2)
+
+        mask, score = self.segment_with_point(image, center)
+
+        margin = 0.15
+        box = (int(w * margin), int(h * margin),
+               int(w * (1 - margin)), int(h * (1 - margin)))
+        mask_box, score_box = self.segment_with_box(image, box)
+
+        if score_box > score:
+            return {
+                'mask': mask_box,
+                'score': float(score_box),
+                'method': 'center_box',
+                'prompt': box
+            }
+        else:
+            return {
+                'mask': mask,
+                'score': float(score),
+                'method': 'center_point',
+                'prompt': center
+            }
+
+    def segment_lesion_features(self, image: np.ndarray) -> Dict[str, Any]:
+        """Strategy 2: Lesion-feature-based segmentation"""
+        candidate_points = self.feature_detector.get_lesion_candidate_points(image, n_points=3)
+        feature_box = self.feature_detector.get_lesion_bounding_box(image)
+
+        best_mask = None
+        best_score = 0
+        best_method = None
+        best_prompt = None
+
+        for i, point in enumerate(candidate_points):
+            try:
+                mask, score = self.segment_with_point(image, point)
+                if score > best_score:
+                    best_mask = mask
+                    best_score = score
+                    best_method = f'feature_point_{i}'
+                    best_prompt = point
+            except Exception:
+                continue
+
+        try:
+            mask_box, score_box = self.segment_with_box(image, feature_box)
+            if score_box > best_score:
+                best_mask = mask_box
+                best_score = score_box
+                best_method = 'feature_box'
+                best_prompt = feature_box
+        except Exception:
+            pass
+
+        if best_mask is None:
+            return self.segment_center_focused(image)
+
+        return {
+            'mask': best_mask,
+            'score': float(best_score),
+            'method': best_method,
+            'prompt': best_prompt
+        }
+
+    def segment_both_strategies(self, image: np.ndarray) -> Dict[str, Dict[str, Any]]:
+        """Run both segmentation strategies"""
+        results = {}
+
+        print("    - Center-focused segmentation...")
+        results['center_focused'] = self.segment_center_focused(image)
+
+        print("    - Lesion-feature-based segmentation...")
+        results['lesion_features'] = self.segment_lesion_features(image)
+
+        return results
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
 
 def apply_mask_to_image(image: np.ndarray, mask: np.ndarray,
                         color: Tuple[int, int, int] = (255, 0, 0),
                         alpha: float = 0.5) -> np.ndarray:
-    """
-    Apply colored mask overlay to image
-
-    Args:
-        image: RGB image as numpy array
-        mask: Binary mask
-        color: RGB color for mask overlay
-        alpha: Transparency (0-1)
-
-    Returns:
-        Image with mask overlay
-    """
+    """Apply colored mask overlay to image"""
     result = image.copy()
     mask_bool = mask.astype(bool)
 
@@ -364,17 +791,7 @@ def apply_mask_to_image(image: np.ndarray, mask: np.ndarray,
 
 def crop_masked_region(image: np.ndarray, mask: np.ndarray,
                        padding: int = 10) -> Optional[np.ndarray]:
-    """
-    Crop the masked region from image with padding
-
-    Args:
-        image: RGB image as numpy array
-        mask: Binary mask
-        padding: Pixels to add around the bounding box
-
-    Returns:
-        Cropped image region or None if mask is empty
-    """
+    """Crop the masked region from image with padding"""
     if not mask.any():
         return None
 
@@ -390,17 +807,7 @@ def crop_masked_region(image: np.ndarray, mask: np.ndarray,
 
 def create_masked_only_image(image: np.ndarray, mask: np.ndarray,
                              background_color: Tuple[int, int, int] = (0, 0, 0)) -> np.ndarray:
-    """
-    Create image showing only the masked region, rest is background color
-
-    Args:
-        image: RGB image as numpy array
-        mask: Binary mask
-        background_color: RGB color for background
-
-    Returns:
-        Image with only masked region visible
-    """
+    """Create image showing only the masked region"""
     result = np.full_like(image, background_color)
     mask_bool = mask.astype(bool)
     result[mask_bool] = image[mask_bool]
@@ -419,7 +826,6 @@ def save_image(image: np.ndarray, path: str):
 
 
 if __name__ == "__main__":
-    # Test with a sample image
     import sys
 
     if len(sys.argv) < 2:
@@ -429,13 +835,16 @@ if __name__ == "__main__":
     image_path = sys.argv[1]
     image = load_image(image_path)
 
-    print("Testing SAM segmentation...")
+    print("Testing SAM segmentation with both strategies...")
     sam = SAMSegmenter()
-    mask, score, method = sam.get_best_lesion_mask(image)
-    print(f"Best mask found using {method} with score {score:.3f}")
+    results = sam.segment_both_strategies(image)
 
-    # Apply and save
-    result = apply_mask_to_image(image, mask)
-    output_path = image_path.replace('.', '_sam_masked.')
-    save_image(result, output_path)
-    print(f"Saved to {output_path}")
+    for strategy, result in results.items():
+        print(f"\n{strategy}:")
+        print(f"  Method: {result['method']}")
+        print(f"  Score: {result['score']:.3f}")
+
+        overlay = apply_mask_to_image(image, result['mask'])
+        output_path = image_path.replace('.', f'_sam_{strategy}.')
+        save_image(overlay, output_path)
+        print(f"  Saved to: {output_path}")
