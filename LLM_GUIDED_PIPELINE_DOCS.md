@@ -397,8 +397,11 @@ python llm_guided_pipeline.py --max-images 10
 # 단일 이미지 처리
 python llm_guided_pipeline.py --single-image <image_path>
 
-# MedSAM2 모델 사용
+# MedSAM2 모델로 10개 처리
 python llm_guided_pipeline.py --segmenter medsam2 --max-images 10
+
+# MedSAM2 모델로 전체 100개 처리
+python llm_guided_pipeline.py --segmenter medsam2 --max-images 0
 
 # 커스텀 데이터 디렉토리 사용
 python llm_guided_pipeline.py --data-dir /path/to/images --output-dir outputs/custom
