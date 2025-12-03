@@ -19,13 +19,18 @@ LLM-Guided SAM Pipeline for Skin Disease Diagnosis
 """
 
 import os
+import sys
 import json
 import base64
+import argparse
+import csv
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Any
+from datetime import datetime
 from io import BytesIO
 from PIL import Image
 import numpy as np
+from tqdm import tqdm
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -368,16 +373,18 @@ Respond in JSON format:
 
     def run_full_pipeline(self, image: np.ndarray,
                           segmenter,
-                          save_intermediates: bool = False,
-                          output_dir: Optional[str] = None) -> Dict:
+                          save_results: bool = False,
+                          output_dir: Optional[str] = None,
+                          filename: Optional[str] = None) -> Dict:
         """
         전체 파이프라인 실행
 
         Args:
             image: RGB numpy array
             segmenter: SAM/SAM2/MedSAM2 segmenter 인스턴스
-            save_intermediates: 중간 결과 저장 여부
+            save_results: 결과 저장 여부
             output_dir: 저장 디렉토리
+            filename: 원본 파일명 (저장 시 사용)
 
         Returns:
             {
@@ -413,6 +420,7 @@ Respond in JSON format:
         )
 
         result = {
+            "filename": filename or "unknown",
             "location_result": location_result,
             "segmentation_results": [
                 {k: v for k, v in seg.items() if k != "mask"}  # mask 제외 (저장용)
@@ -422,12 +430,96 @@ Respond in JSON format:
             "overlay_image": overlay,
             "masks": [seg.get("mask") for seg in segmentation_results if "mask" in seg],
             "total_tokens": total_tokens,
-            "pipeline": "llm_guided"
+            "pipeline": "llm_guided",
+            "timestamp": datetime.now().isoformat()
         }
+
+        # 결과 저장
+        if save_results and output_dir:
+            self._save_results(result, image, output_dir, filename)
 
         print(f"\n=== 파이프라인 완료 (총 {total_tokens} 토큰 사용) ===")
 
         return result
+
+    def _save_results(self, result: Dict, original: np.ndarray,
+                      output_dir: str, filename: Optional[str] = None):
+        """
+        결과를 파일로 저장
+
+        Args:
+            result: 파이프라인 실행 결과
+            original: 원본 이미지
+            output_dir: 저장 디렉토리
+            filename: 원본 파일명
+        """
+        from sam_masking import save_image
+
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        stem = Path(filename).stem if filename else "image"
+
+        # 1. 오버레이 이미지 저장
+        overlay_dir = output_path / "overlays"
+        overlay_dir.mkdir(parents=True, exist_ok=True)
+        save_image(result["overlay_image"], str(overlay_dir / f"{stem}_llm_guided_overlay.png"))
+
+        # 2. 개별 마스크 저장
+        masks_dir = output_path / "masks"
+        masks_dir.mkdir(parents=True, exist_ok=True)
+        for idx, mask in enumerate(result.get("masks", [])):
+            if mask is not None:
+                mask_img = (mask * 255).astype(np.uint8)
+                save_image(mask_img, str(masks_dir / f"{stem}_mask_{idx}.png"))
+
+        # 3. JSON 결과 저장
+        json_dir = output_path / "json"
+        json_dir.mkdir(parents=True, exist_ok=True)
+
+        # mask와 overlay_image는 저장에서 제외
+        json_result = {
+            k: v for k, v in result.items()
+            if k not in ["overlay_image", "masks"]
+        }
+
+        with open(json_dir / f"{stem}_result.json", 'w', encoding='utf-8') as f:
+            json.dump(json_result, f, indent=2, ensure_ascii=False, default=str)
+
+        # 4. 비교 이미지 저장 (원본 + 오버레이)
+        comparison_dir = output_path / "comparisons"
+        comparison_dir.mkdir(parents=True, exist_ok=True)
+        self._save_comparison_figure(
+            original, result["overlay_image"],
+            result.get("location_result", {}),
+            str(comparison_dir / f"{stem}_comparison.png")
+        )
+
+        print(f"    → 결과 저장됨: {output_path}")
+
+    def _save_comparison_figure(self, original: np.ndarray, overlay: np.ndarray,
+                                 location_info: Dict, save_path: str):
+        """원본과 오버레이 비교 이미지 생성"""
+        try:
+            import matplotlib.pyplot as plt
+
+            fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+
+            axes[0].imshow(original)
+            axes[0].set_title("Original Image", fontsize=12, fontweight='bold')
+            axes[0].axis('off')
+
+            axes[1].imshow(overlay)
+            lesion_count = location_info.get("lesion_count", 0)
+            axes[1].set_title(f"LLM-Guided Segmentation ({lesion_count} lesions)",
+                             fontsize=12, fontweight='bold')
+            axes[1].axis('off')
+
+            plt.tight_layout()
+            plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+            plt.close()
+        except Exception as e:
+            print(f"    비교 이미지 저장 실패: {e}")
 
 
 def compare_pipelines(image: np.ndarray,
@@ -509,42 +601,386 @@ def _get_top_diagnosis(diagnosis: Dict) -> str:
     return "Unknown"
 
 
-if __name__ == "__main__":
-    # 테스트
-    from sam_masking import SAMSegmenter, load_image
-    import sys
+def get_image_files(data_dir: str, extensions: tuple = ('.jpg', '.jpeg', '.png', '.bmp')) -> List[Path]:
+    """디렉토리에서 이미지 파일 목록 가져오기"""
+    data_path = Path(data_dir)
+    image_files = []
 
-    if len(sys.argv) < 2:
-        print("Usage: python llm_guided_pipeline.py <image_path>")
+    for ext in extensions:
+        image_files.extend(data_path.rglob(f"*{ext}"))
+        image_files.extend(data_path.rglob(f"*{ext.upper()}"))
+
+    return sorted(image_files)
+
+
+def run_batch_pipeline(
+    data_dir: str,
+    output_dir: str,
+    max_images: Optional[int] = None,
+    segmenter_type: str = "sam",
+    save_csv: bool = True
+) -> List[Dict]:
+    """
+    배치 처리 파이프라인 실행
+
+    Args:
+        data_dir: 이미지 디렉토리
+        output_dir: 결과 저장 디렉토리
+        max_images: 최대 처리 이미지 수
+        segmenter_type: 사용할 분할 모델 (sam, sam2, medsam2)
+        save_csv: CSV 요약 저장 여부
+
+    Returns:
+        전체 결과 리스트
+    """
+    from sam_masking import SAMSegmenter, SAM2Segmenter, MedSAM2Segmenter, load_image
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # 이미지 파일 목록
+    image_files = get_image_files(data_dir)
+    if max_images:
+        image_files = image_files[:max_images]
+
+    print(f"\n{'='*60}")
+    print(f"LLM-Guided SAM Batch Pipeline")
+    print(f"{'='*60}")
+    print(f"이미지 수: {len(image_files)}")
+    print(f"분할 모델: {segmenter_type.upper()}")
+    print(f"출력 디렉토리: {output_path}")
+    print(f"{'='*60}\n")
+
+    # Segmenter 초기화
+    checkpoint_dir = str(output_path / "checkpoints")
+
+    print(f"[{segmenter_type.upper()}] 모델 초기화 중...")
+    if segmenter_type.lower() == "sam":
+        segmenter = SAMSegmenter(checkpoint_dir=checkpoint_dir)
+    elif segmenter_type.lower() == "sam2":
+        segmenter = SAM2Segmenter(checkpoint_dir=checkpoint_dir)
+    elif segmenter_type.lower() == "medsam2":
+        segmenter = MedSAM2Segmenter(checkpoint_dir=checkpoint_dir)
+    else:
+        print(f"지원하지 않는 모델: {segmenter_type}")
         sys.exit(1)
-
-    image_path = sys.argv[1]
-    image = load_image(image_path)
-
-    print(f"이미지 로드: {image_path}")
-    print(f"크기: {image.shape}")
-
-    # SAM 초기화
-    segmenter = SAMSegmenter(checkpoint_dir="outputs/checkpoints")
 
     # LLM-Guided Pipeline 초기화
     pipeline = LLMGuidedSegmenter()
 
-    # 파이프라인 실행
-    result = pipeline.run_full_pipeline(image, segmenter)
+    # 결과 저장
+    all_results = []
+    csv_rows = []
 
-    # 결과 출력
-    print("\n=== 결과 요약 ===")
-    print(f"감지된 병변 수: {result['location_result'].get('lesion_count', 0)}")
+    for idx, image_path in enumerate(tqdm(image_files, desc="Processing")):
+        print(f"\n[{idx+1}/{len(image_files)}] {image_path.name}")
 
-    if result['diagnosis_result'].get('possible_conditions'):
-        print("\n진단 결과:")
-        for cond in result['diagnosis_result']['possible_conditions'][:3]:
-            if isinstance(cond, dict):
-                print(f"  - {cond.get('name', 'N/A')} ({cond.get('confidence', 'N/A')})")
+        try:
+            image = load_image(str(image_path))
 
-    # 오버레이 저장
-    from sam_masking import save_image
-    output_path = image_path.replace('.', '_llm_guided.')
-    save_image(result['overlay_image'], output_path)
-    print(f"\n오버레이 저장: {output_path}")
+            result = pipeline.run_full_pipeline(
+                image=image,
+                segmenter=segmenter,
+                save_results=True,
+                output_dir=str(output_path),
+                filename=image_path.name
+            )
+
+            all_results.append(result)
+
+            # CSV 행 추가
+            csv_row = _extract_csv_row(result, image_path.name)
+            csv_rows.append(csv_row)
+
+        except Exception as e:
+            print(f"  오류 발생: {e}")
+            all_results.append({
+                "filename": image_path.name,
+                "error": str(e)
+            })
+            csv_rows.append({
+                "filename": image_path.name,
+                "error": str(e),
+                "lesion_count": 0,
+                "top_diagnosis": "Error",
+                "confidence": "N/A",
+                "tokens_used": 0
+            })
+
+    # 전체 결과 JSON 저장
+    summary_path = output_path / "all_results.json"
+    json_results = [
+        {k: v for k, v in r.items() if k not in ["overlay_image", "masks"]}
+        for r in all_results
+    ]
+    with open(summary_path, 'w', encoding='utf-8') as f:
+        json.dump(json_results, f, indent=2, ensure_ascii=False, default=str)
+    print(f"\n전체 결과 저장: {summary_path}")
+
+    # CSV 저장
+    if save_csv:
+        csv_path = output_path / "diagnosis_summary.csv"
+        _save_csv(csv_rows, csv_path)
+        print(f"CSV 요약 저장: {csv_path}")
+
+    # 마크다운 리포트 생성
+    report_path = output_path / "diagnosis_report.md"
+    _generate_report(all_results, report_path)
+    print(f"리포트 저장: {report_path}")
+
+    # 요약 출력
+    _print_summary(all_results)
+
+    return all_results
+
+
+def _extract_csv_row(result: Dict, filename: str) -> Dict:
+    """결과에서 CSV 행 추출"""
+    row = {
+        "filename": filename,
+        "lesion_count": result.get("location_result", {}).get("lesion_count", 0),
+        "image_quality": result.get("location_result", {}).get("image_quality", "N/A"),
+        "tokens_used": result.get("total_tokens", 0),
+    }
+
+    # 진단 결과 추출
+    diagnosis = result.get("diagnosis_result", {})
+    conditions = diagnosis.get("possible_conditions", [])
+
+    if conditions and isinstance(conditions, list) and len(conditions) > 0:
+        top = conditions[0]
+        if isinstance(top, dict):
+            row["top_diagnosis"] = top.get("name", "Unknown")
+            row["confidence"] = top.get("confidence", "N/A")
+        else:
+            row["top_diagnosis"] = str(top)
+            row["confidence"] = "N/A"
+    else:
+        row["top_diagnosis"] = "Unknown"
+        row["confidence"] = "N/A"
+
+    # 세그멘테이션 품질
+    seg_quality = diagnosis.get("segmentation_quality", {})
+    row["segmentation_accuracy"] = seg_quality.get("accuracy", "N/A")
+
+    # 주요 특징
+    features = diagnosis.get("observed_features", {})
+    row["color"] = features.get("color", "N/A")
+    row["shape"] = features.get("shape", "N/A")
+
+    return row
+
+
+def _save_csv(rows: List[Dict], path: Path):
+    """CSV 파일 저장"""
+    if not rows:
+        return
+
+    fieldnames = [
+        "filename", "lesion_count", "image_quality", "top_diagnosis",
+        "confidence", "segmentation_accuracy", "color", "shape", "tokens_used"
+    ]
+
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _generate_report(results: List[Dict], path: Path):
+    """마크다운 리포트 생성"""
+    lines = [
+        "# LLM-Guided SAM Pipeline 진단 리포트",
+        "",
+        f"생성 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        "## 요약",
+        "",
+        f"- 총 분석 이미지: {len(results)}",
+    ]
+
+    successful = [r for r in results if "error" not in r]
+    failed = [r for r in results if "error" in r]
+
+    lines.append(f"- 성공: {len(successful)}")
+    lines.append(f"- 실패: {len(failed)}")
+    lines.append("")
+
+    if successful:
+        total_tokens = sum(r.get("total_tokens", 0) for r in successful)
+        total_lesions = sum(r.get("location_result", {}).get("lesion_count", 0) for r in successful)
+        lines.append(f"- 총 토큰 사용량: {total_tokens:,}")
+        lines.append(f"- 총 감지 병변 수: {total_lesions}")
+        lines.append("")
+
+        # 진단 결과 통계
+        lines.append("## 진단 결과 분포")
+        lines.append("")
+
+        diagnosis_counts = {}
+        for r in successful:
+            conditions = r.get("diagnosis_result", {}).get("possible_conditions", [])
+            if conditions and isinstance(conditions, list):
+                for cond in conditions[:1]:  # top-1만
+                    if isinstance(cond, dict):
+                        name = cond.get("name", "Unknown")
+                        diagnosis_counts[name] = diagnosis_counts.get(name, 0) + 1
+
+        for name, count in sorted(diagnosis_counts.items(), key=lambda x: -x[1])[:10]:
+            lines.append(f"- {name}: {count}건")
+
+        lines.append("")
+
+    # 개별 결과
+    lines.append("## 개별 분석 결과")
+    lines.append("")
+
+    for r in successful[:20]:  # 최대 20개
+        filename = r.get("filename", "Unknown")
+        lines.append(f"### {filename}")
+        lines.append("")
+
+        lesion_count = r.get("location_result", {}).get("lesion_count", 0)
+        lines.append(f"**병변 수**: {lesion_count}")
+        lines.append("")
+
+        conditions = r.get("diagnosis_result", {}).get("possible_conditions", [])
+        if conditions:
+            lines.append("**진단 결과**:")
+            for cond in conditions[:3]:
+                if isinstance(cond, dict):
+                    name = cond.get("name", "Unknown")
+                    conf = cond.get("confidence", "N/A")
+                    lines.append(f"- {name} ({conf})")
+            lines.append("")
+
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+
+
+def _print_summary(results: List[Dict]):
+    """결과 요약 출력"""
+    print("\n" + "="*60)
+    print("파이프라인 완료!")
+    print("="*60)
+
+    successful = [r for r in results if "error" not in r]
+    failed = [r for r in results if "error" in r]
+
+    print(f"총 처리: {len(results)}")
+    print(f"성공: {len(successful)}")
+    print(f"실패: {len(failed)}")
+
+    if successful:
+        total_tokens = sum(r.get("total_tokens", 0) for r in successful)
+        avg_tokens = total_tokens / len(successful)
+        print(f"총 토큰: {total_tokens:,} (평균: {avg_tokens:.0f})")
+
+        total_lesions = sum(r.get("location_result", {}).get("lesion_count", 0) for r in successful)
+        avg_lesions = total_lesions / len(successful)
+        print(f"총 병변: {total_lesions} (평균: {avg_lesions:.1f})")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="LLM-Guided SAM Pipeline for Skin Disease Diagnosis"
+    )
+
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default="Derm1M_v2_pretrain_ontology_sampled_100_images",
+        help="이미지 디렉토리 경로"
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="outputs/llm_guided",
+        help="결과 저장 디렉토리"
+    )
+    parser.add_argument(
+        "--max-images",
+        type=int,
+        default=None,
+        help="최대 처리 이미지 수"
+    )
+    parser.add_argument(
+        "--segmenter",
+        type=str,
+        choices=["sam", "sam2", "medsam2"],
+        default="sam",
+        help="사용할 분할 모델"
+    )
+    parser.add_argument(
+        "--single-image",
+        type=str,
+        default=None,
+        help="단일 이미지 처리 (배치 대신)"
+    )
+    parser.add_argument(
+        "--no-csv",
+        action="store_true",
+        help="CSV 저장 건너뛰기"
+    )
+
+    args = parser.parse_args()
+
+    # 단일 이미지 모드
+    if args.single_image:
+        from sam_masking import SAMSegmenter, SAM2Segmenter, MedSAM2Segmenter, load_image, save_image
+
+        image_path = args.single_image
+        if not Path(image_path).exists():
+            print(f"파일을 찾을 수 없음: {image_path}")
+            sys.exit(1)
+
+        image = load_image(image_path)
+        print(f"이미지 로드: {image_path}")
+        print(f"크기: {image.shape}")
+
+        # Segmenter 초기화
+        checkpoint_dir = str(Path(args.output_dir) / "checkpoints")
+        if args.segmenter == "sam":
+            segmenter = SAMSegmenter(checkpoint_dir=checkpoint_dir)
+        elif args.segmenter == "sam2":
+            segmenter = SAM2Segmenter(checkpoint_dir=checkpoint_dir)
+        else:
+            segmenter = MedSAM2Segmenter(checkpoint_dir=checkpoint_dir)
+
+        # 파이프라인 실행
+        pipeline = LLMGuidedSegmenter()
+        result = pipeline.run_full_pipeline(
+            image=image,
+            segmenter=segmenter,
+            save_results=True,
+            output_dir=args.output_dir,
+            filename=Path(image_path).name
+        )
+
+        # 결과 출력
+        print("\n=== 결과 요약 ===")
+        print(f"감지된 병변 수: {result['location_result'].get('lesion_count', 0)}")
+
+        if result['diagnosis_result'].get('possible_conditions'):
+            print("\n진단 결과:")
+            for cond in result['diagnosis_result']['possible_conditions'][:3]:
+                if isinstance(cond, dict):
+                    print(f"  - {cond.get('name', 'N/A')} ({cond.get('confidence', 'N/A')})")
+
+    else:
+        # 배치 모드
+        if not Path(args.data_dir).exists():
+            print(f"디렉토리를 찾을 수 없음: {args.data_dir}")
+            sys.exit(1)
+
+        run_batch_pipeline(
+            data_dir=args.data_dir,
+            output_dir=args.output_dir,
+            max_images=args.max_images,
+            segmenter_type=args.segmenter,
+            save_csv=not args.no_csv
+        )
+
+
+if __name__ == "__main__":
+    main()

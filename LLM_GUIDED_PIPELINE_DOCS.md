@@ -307,7 +307,7 @@ def run_full_pipeline(self, image, segmenter) -> Dict:
 
 ## 5. 사용 방법
 
-### 5.1 기본 사용
+### 5.1 기본 사용 (Python API)
 
 ```python
 from llm_guided_pipeline import LLMGuidedSegmenter
@@ -322,15 +322,18 @@ segmenter = SAMSegmenter(checkpoint_dir="outputs/checkpoints")
 # LLM-Guided Pipeline 초기화
 pipeline = LLMGuidedSegmenter()
 
-# 전체 파이프라인 실행
-result = pipeline.run_full_pipeline(image, segmenter)
+# 전체 파이프라인 실행 (결과 자동 저장)
+result = pipeline.run_full_pipeline(
+    image=image,
+    segmenter=segmenter,
+    save_results=True,           # 결과 저장 활성화
+    output_dir="outputs/llm_guided",  # 저장 디렉토리
+    filename="skin_lesion.png"   # 원본 파일명
+)
 
 # 결과 확인
 print(f"감지된 병변: {result['location_result']['lesion_count']}개")
 print(f"진단: {result['diagnosis_result']['possible_conditions']}")
-
-# 오버레이 저장
-save_image(result['overlay_image'], "output_overlay.png")
 ```
 
 ### 5.2 단계별 실행
@@ -364,20 +367,178 @@ segmenter = MedSAM2Segmenter(checkpoint_dir="outputs/checkpoints")
 result = pipeline.run_full_pipeline(image, segmenter)
 ```
 
-### 5.4 커맨드라인 실행
+### 5.4 배치 처리 (여러 이미지)
+
+```python
+from llm_guided_pipeline import run_batch_pipeline
+
+# 디렉토리 내 모든 이미지 처리
+results = run_batch_pipeline(
+    data_dir="Derm1M_v2_pretrain_ontology_sampled_100_images",
+    output_dir="outputs/llm_guided",
+    max_images=10,           # 최대 10개만 처리 (None이면 전체)
+    segmenter_type="sam",    # "sam", "sam2", "medsam2"
+    save_csv=True            # CSV 요약 저장
+)
+```
+
+### 5.5 커맨드라인 실행 (CLI)
 
 ```bash
-python llm_guided_pipeline.py <image_path>
+# 단일 이미지 처리
+python llm_guided_pipeline.py --single-image <image_path> --segmenter sam
 
-# 예시
-python llm_guided_pipeline.py outputs/visualizations/10730_4.png
+# 배치 처리 (디렉토리 전체)
+python llm_guided_pipeline.py --data-dir <image_dir> --output-dir outputs/llm_guided
+
+# 전체 옵션
+python llm_guided_pipeline.py \
+    --data-dir Derm1M_v2_pretrain_ontology_sampled_100_images \
+    --output-dir outputs/llm_guided \
+    --max-images 5 \
+    --segmenter medsam2 \
+    --no-csv  # CSV 저장 생략
+```
+
+**CLI 옵션:**
+
+| 옵션 | 설명 | 기본값 |
+|------|------|--------|
+| `--data-dir` | 이미지 디렉토리 경로 | `Derm1M_v2_...` |
+| `--output-dir` | 결과 저장 디렉토리 | `outputs/llm_guided` |
+| `--max-images` | 최대 처리 이미지 수 | None (전체) |
+| `--segmenter` | 분할 모델 (sam/sam2/medsam2) | `sam` |
+| `--single-image` | 단일 이미지 경로 (배치 대신) | None |
+| `--no-csv` | CSV 저장 건너뛰기 | False |
+
+---
+
+## 6. 출력 파일 구조
+
+### 6.1 디렉토리 구조
+
+파이프라인 실행 후 생성되는 출력 디렉토리 구조:
+
+```
+outputs/llm_guided/
+├── overlays/                    # 오버레이 이미지
+│   ├── image1_llm_guided_overlay.png
+│   ├── image2_llm_guided_overlay.png
+│   └── ...
+├── masks/                       # 개별 마스크 이미지
+│   ├── image1_mask_0.png        # 첫 번째 병변 마스크
+│   ├── image1_mask_1.png        # 두 번째 병변 마스크
+│   └── ...
+├── comparisons/                 # 원본-오버레이 비교 이미지
+│   ├── image1_comparison.png
+│   └── ...
+├── json/                        # 개별 결과 JSON
+│   ├── image1_result.json
+│   └── ...
+├── checkpoints/                 # 모델 체크포인트 (자동 다운로드)
+├── all_results.json             # 전체 결과 통합 JSON
+├── diagnosis_summary.csv        # CSV 요약 테이블
+└── diagnosis_report.md          # 마크다운 리포트
+```
+
+### 6.2 개별 결과 JSON 구조
+
+`json/<filename>_result.json`:
+
+```json
+{
+    "filename": "skin_lesion.png",
+    "location_result": {
+        "lesion_count": 2,
+        "lesions": [
+            {
+                "id": 1,
+                "center_x_percent": 35.5,
+                "center_y_percent": 48.2,
+                "size": "medium",
+                "visual_description": "erythematous patch"
+            }
+        ],
+        "image_quality": "good",
+        "tokens_used": 450
+    },
+    "segmentation_results": [
+        {
+            "lesion_id": 1,
+            "location": {"x": 284, "y": 386, "x_percent": 35.5, "y_percent": 48.2},
+            "score": 0.9823,
+            "method": "llm_guided"
+        }
+    ],
+    "diagnosis_result": {
+        "observed_features": {
+            "color": "pink to red",
+            "shape": "oval",
+            "texture": "scaly surface",
+            "borders": "well-defined"
+        },
+        "possible_conditions": [
+            {"name": "Psoriasis", "confidence": "High"},
+            {"name": "Eczema", "confidence": "Medium"}
+        ],
+        "segmentation_quality": {
+            "accuracy": "good",
+            "comments": "Accurately captured lesion boundaries"
+        },
+        "tokens_used": 1200
+    },
+    "total_tokens": 1650,
+    "pipeline": "llm_guided",
+    "timestamp": "2024-12-03T14:30:25.123456"
+}
+```
+
+### 6.3 CSV 요약 구조
+
+`diagnosis_summary.csv`:
+
+| filename | lesion_count | image_quality | top_diagnosis | confidence | segmentation_accuracy | color | shape | tokens_used |
+|----------|--------------|---------------|---------------|------------|----------------------|-------|-------|-------------|
+| img1.png | 2 | good | Psoriasis | High | good | pink | oval | 1650 |
+| img2.png | 1 | moderate | Eczema | Medium | partial | red | irregular | 1420 |
+| img3.png | 0 | poor | Unknown | N/A | N/A | N/A | N/A | 450 |
+
+### 6.4 마크다운 리포트
+
+`diagnosis_report.md` 내용:
+
+```markdown
+# LLM-Guided SAM Pipeline 진단 리포트
+
+생성 시간: 2024-12-03 14:35:00
+
+## 요약
+- 총 분석 이미지: 100
+- 성공: 98
+- 실패: 2
+- 총 토큰 사용량: 165,000
+- 총 감지 병변 수: 142
+
+## 진단 결과 분포
+- Psoriasis: 25건
+- Eczema: 18건
+- Contact Dermatitis: 12건
+...
+
+## 개별 분석 결과
+### image1.png
+**병변 수**: 2
+**진단 결과**:
+- Psoriasis (High)
+- Eczema (Medium)
+...
 ```
 
 ---
 
-## 6. 기존 파이프라인과의 비교
+## 7. 기존 파이프라인과의 비교
 
-### 6.1 처리 흐름 비교
+### 7.1 처리 흐름 비교
 
 **기존:**
 ```
@@ -400,14 +561,14 @@ python llm_guided_pipeline.py outputs/visualizations/10730_4.png
         "여기가 병변"      정확한 해당 위치 분할
 ```
 
-### 6.2 API 호출 비교
+### 7.2 API 호출 비교
 
 | 방식 | API 호출 | 이미지 수 | 예상 비용 |
 |------|----------|-----------|-----------|
 | 기존 (3가지 진단) | 3회 | 5장 | ~$0.10 |
 | **LLM-Guided** | **2회** | **3장** | **~$0.07** |
 
-### 6.3 예상 정확도 비교
+### 7.3 예상 정확도 비교
 
 | 상황 | 기존 | LLM-Guided |
 |------|------|------------|
@@ -418,9 +579,9 @@ python llm_guided_pipeline.py outputs/visualizations/10730_4.png
 
 ---
 
-## 7. 한계점 및 향후 개선
+## 8. 한계점 및 향후 개선
 
-### 7.1 현재 한계
+### 8.1 현재 한계
 
 | 한계 | 설명 | 가능한 해결책 |
 |------|------|---------------|
@@ -429,7 +590,7 @@ python llm_guided_pipeline.py outputs/visualizations/10730_4.png
 | 좌표 정밀도 | 퍼센트 단위로 한계 있음 | 박스 좌표 추가 |
 | 작은 병변 | LLM이 작은 병변을 놓칠 수 있음 | 멀티스케일 분석 |
 
-### 7.2 향후 개선 방향
+### 8.2 향후 개선 방향
 
 1. **앙상블 위치 파악**
    ```python
@@ -470,9 +631,9 @@ python llm_guided_pipeline.py outputs/visualizations/10730_4.png
 
 ---
 
-## 8. 결론
+## 9. 결론
 
-### 8.1 핵심 혁신
+### 9.1 핵심 혁신
 
 > **"LLM의 지능으로 SAM을 가이드한다"**
 
@@ -480,7 +641,7 @@ python llm_guided_pipeline.py outputs/visualizations/10730_4.png
 개선된 파이프라인에서는 LLM이 먼저 병변 위치를 파악하고,
 SAM은 그 위치를 정밀하게 분할하는 역할만 수행합니다.
 
-### 8.2 기대 효과 요약
+### 9.2 기대 효과 요약
 
 | 지표 | 개선 효과 |
 |------|-----------|
@@ -489,7 +650,7 @@ SAM은 그 위치를 정밀하게 분할하는 역할만 수행합니다.
 | API 비용 | -30% |
 | 잘못된 분할 선택 | -60% |
 
-### 8.3 권장 사용 시나리오
+### 9.3 권장 사용 시나리오
 
 - ✅ 병변 위치가 불확실한 이미지
 - ✅ 다발성 병변이 있는 이미지
@@ -498,5 +659,6 @@ SAM은 그 위치를 정밀하게 분할하는 역할만 수행합니다.
 
 ---
 
-*문서 작성일: 2024*
-*LLM-Guided SAM Pipeline v1.0*
+*문서 작성일: 2024-12-03*
+*LLM-Guided SAM Pipeline v1.1*
+*업데이트: 결과 저장, 배치 처리, CLI 기능 추가*
