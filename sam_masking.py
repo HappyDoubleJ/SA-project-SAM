@@ -683,7 +683,9 @@ class MedSAM2Segmenter:
         if self.medsam2_repo_path:
             possible_paths = [
                 self.medsam2_repo_path / "configs" / self.CONFIG_NAME,
+                self.medsam2_repo_path / "sam2" / "configs" / "sam2.1_hiera_t.yaml",
                 self.medsam2_repo_path / "sam2" / "configs" / "sam2.1" / "sam2.1_hiera_t.yaml",
+                self.medsam2_repo_path / "sam2" / "sam2" / "configs" / "sam2.1_hiera_t.yaml",
             ]
             for path in possible_paths:
                 if path.exists():
