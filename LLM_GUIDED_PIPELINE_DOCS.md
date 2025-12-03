@@ -385,31 +385,51 @@ results = run_batch_pipeline(
 ### 5.5 커맨드라인 실행 (CLI)
 
 ```bash
+# 기본 실행 (샘플 데이터셋에서 5개 이미지 자동 처리)
+python llm_guided_pipeline.py
+
+# 전체 이미지 처리 (100개)
+python llm_guided_pipeline.py --max-images 0
+
+# 특정 개수만 처리
+python llm_guided_pipeline.py --max-images 10
+
 # 단일 이미지 처리
-python llm_guided_pipeline.py --single-image <image_path> --segmenter sam
+python llm_guided_pipeline.py --single-image <image_path>
 
-# 배치 처리 (디렉토리 전체)
-python llm_guided_pipeline.py --data-dir <image_dir> --output-dir outputs/llm_guided
+# MedSAM2 모델 사용
+python llm_guided_pipeline.py --segmenter medsam2 --max-images 10
 
-# 전체 옵션
-python llm_guided_pipeline.py \
-    --data-dir Derm1M_v2_pretrain_ontology_sampled_100_images \
-    --output-dir outputs/llm_guided \
-    --max-images 5 \
-    --segmenter medsam2 \
-    --no-csv  # CSV 저장 생략
+# 커스텀 데이터 디렉토리 사용
+python llm_guided_pipeline.py --data-dir /path/to/images --output-dir outputs/custom
 ```
+
+**자동 데이터 탐지:**
+- `--data-dir` 옵션을 생략하면 자동으로 `Derm1M_v2_pretrain_ontology_sampled_100_images` 폴더를 찾습니다
+- 현재 디렉토리 → 스크립트 위치 순서로 탐색
 
 **CLI 옵션:**
 
 | 옵션 | 설명 | 기본값 |
 |------|------|--------|
-| `--data-dir` | 이미지 디렉토리 경로 | `Derm1M_v2_...` |
+| `--data-dir` | 이미지 디렉토리 경로 | 자동 탐지 |
 | `--output-dir` | 결과 저장 디렉토리 | `outputs/llm_guided` |
-| `--max-images` | 최대 처리 이미지 수 | None (전체) |
+| `--max-images` | 최대 처리 이미지 수 (0=전체) | 5 |
 | `--segmenter` | 분할 모델 (sam/sam2/medsam2) | `sam` |
 | `--single-image` | 단일 이미지 경로 (배치 대신) | None |
 | `--no-csv` | CSV 저장 건너뛰기 | False |
+
+**샘플 데이터셋 구조:**
+```
+Derm1M_v2_pretrain_ontology_sampled_100_images/
+├── IIYI/       # 이미지 소스 1
+├── edu/        # 교육 자료 이미지
+├── note/       # 의료 노트 이미지
+├── public/     # 공개 데이터셋
+├── pubmed/     # PubMed 논문 이미지
+└── youtube/    # YouTube 캡처
+총 100개 피부 질환 이미지
+```
 
 ---
 
