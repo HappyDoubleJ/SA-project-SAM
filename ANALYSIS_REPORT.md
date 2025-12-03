@@ -465,5 +465,610 @@ normalized = image - skin_mean_lab
 
 ---
 
+# Part 2: OpenAI LLM 진단 시스템 및 전체 파이프라인 분석
+
+## 10. 전체 파이프라인 흐름도
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Main Pipeline (main.py)                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────┐                                                        │
+│  │  입력 이미지 │  Derm1M_v2_pretrain_ontology_sampled_100_images/      │
+│  │   디렉토리   │  (.jpg, .jpeg, .png, .bmp)                            │
+│  └──────┬──────┘                                                        │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │              모델 초기화 (Lazy Loading)                          │   │
+│  │  ┌─────────┐  ┌──────────┐  ┌────────────┐                      │   │
+│  │  │   SAM   │  │   SAM2   │  │  MedSAM2   │                      │   │
+│  │  │ (ViT-H) │  │(Hiera-L) │  │ (Hiera-T)  │                      │   │
+│  │  └─────────┘  └──────────┘  └────────────┘                      │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │           이미지별 분할 처리 (process_single_image)              │   │
+│  │                                                                  │   │
+│  │  각 모델 × 2 전략 = 최대 6개 분할 결과                           │   │
+│  │  - SAM_center_focused, SAM_lesion_features                       │   │
+│  │  - SAM2_center_focused, SAM2_lesion_features                     │   │
+│  │  - MedSAM2_center_focused, MedSAM2_lesion_features               │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │              시각화 저장 (visualize.py)                          │   │
+│  │  - 개별 오버레이 이미지                                          │   │
+│  │  - 크롭된 병변 영역                                              │   │
+│  │  - 전체 비교 그리드                                              │   │
+│  │  - 마스크 차이 분석 (IoU, Dice)                                  │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │           OpenAI 진단 (openai_diagnosis.py)                      │   │
+│  │                                                                  │   │
+│  │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐  │   │
+│  │  │ Original Only   │  │ With Overlay    │  │ With Cropped    │  │   │
+│  │  │ (원본만)        │  │ (원본+마스크)   │  │ (원본+크롭)     │  │   │
+│  │  └─────────────────┘  └─────────────────┘  └─────────────────┘  │   │
+│  │                              │                                   │   │
+│  │                              ▼                                   │   │
+│  │                    GPT-4o Vision API                             │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                        출력 결과물                               │   │
+│  │  outputs/                                                        │   │
+│  │  ├── checkpoints/          (모델 체크포인트)                     │   │
+│  │  ├── visualizations/       (시각화 이미지)                       │   │
+│  │  ├── diagnosis/            (진단 JSON 파일)                      │   │
+│  │  ├── segmentation_results.json                                   │   │
+│  │  └── diagnosis_report.md                                         │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 11. OpenAI 진단 시스템 상세 분석 (openai_diagnosis.py)
+
+### 11.1 SkinDiseaseDiagnoser 클래스 구조
+
+```python
+class SkinDiseaseDiagnoser:
+    """OpenAI-based skin disease diagnosis using GPT-4 Vision"""
+
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.client = OpenAI(api_key=self.api_key)
+        self.model = "gpt-4o"  # GPT-4o 비전 모델 사용
+```
+
+### 11.2 사용 모델 및 API 설정
+
+| 설정 | 값 | 선택 근거 |
+|------|-----|-----------|
+| **모델** | `gpt-4o` | 최신 멀티모달 모델, 이미지 분석 능력 최상 |
+| **max_tokens** | 2000 | 상세한 진단 결과를 위해 충분한 토큰 할당 |
+| **temperature** | 0.3 | 낮은 값으로 일관성 있는 의료 분석 유도 |
+| **detail** | "high" | 고해상도 이미지 분석 모드 |
+
+### 11.3 프롬프트 설계 분석
+
+#### 11.3.1 단일 이미지 진단 프롬프트 (DIAGNOSIS_PROMPT)
+
+```python
+DIAGNOSIS_PROMPT = """You are an expert dermatologist AI assistant.
+Analyze the provided skin image(s) and provide a detailed diagnosis.
+
+For each image analysis, provide:
+1. **Observed Features**: Describe the visible skin lesion characteristics
+   (color, shape, texture, borders, size estimation)
+2. **Possible Conditions**: List the top 3-5 most likely skin conditions
+3. **Confidence Level**: Rate your confidence (Low/Medium/High)
+4. **Key Differentiating Factors**: What features led to your diagnosis
+5. **Recommended Actions**: Suggest next steps
+...
+"""
+```
+
+**프롬프트 설계 근거:**
+
+| 요소 | 설명 | 의도 |
+|------|------|------|
+| **역할 지정** | "expert dermatologist AI" | 전문가 수준의 분석 유도 |
+| **구조화된 출력** | JSON 형식 강제 | 파싱 용이성, 일관된 결과 |
+| **다중 조건 요청** | "top 3-5 conditions" | 불확실성 반영, 감별진단 |
+| **신뢰도 레벨** | Low/Medium/High | 결과 해석 가이드 |
+| **면책 조항** | "educational/research purposes" | 법적 보호 |
+
+#### 11.3.2 비교 진단 프롬프트 (COMPARISON_PROMPT)
+
+```python
+COMPARISON_PROMPT = """You are provided with two views of the same skin lesion:
+1. The original full image
+2. A highlighted/segmented view showing the lesion area of interest
+
+Analyze both images together and provide a comprehensive diagnosis.
+The segmented image helps you focus on the specific area of concern.
+...
+"""
+```
+
+**추가 요소:**
+
+| 필드 | 목적 |
+|------|------|
+| `segmentation_benefits` | SAM 분할이 진단에 도움이 되었는지 평가 |
+
+### 11.4 진단 방법 비교
+
+#### 11.4.1 방법 1: 원본 이미지만 사용
+
+```python
+def diagnose_original_only(self, image: np.ndarray) -> Dict:
+    """단일 원본 이미지로 진단"""
+    base64_image = self._encode_image(image)
+
+    response = self.client.chat.completions.create(
+        model=self.model,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": self.DIAGNOSIS_PROMPT},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{base64_image}",
+                        "detail": "high"  # 고해상도 분석
+                    }
+                }
+            ]
+        }],
+        max_tokens=2000,
+        temperature=0.3
+    )
+```
+
+**장점:**
+- 비용 효율적 (이미지 1개)
+- 빠른 응답
+- 기준선(Baseline) 역할
+
+**단점:**
+- 병변 위치 불명확
+- 배경 영역에 주의 분산 가능
+
+#### 11.4.2 방법 2: 원본 + 마스크 오버레이
+
+```python
+def diagnose_with_mask(self, original, masked_overlay, cropped=None, use_cropped=False):
+    """원본과 분할 결과를 함께 제공"""
+
+    # 두 이미지를 순차적으로 제공
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": self.COMPARISON_PROMPT},
+            {"type": "text", "text": "Image 1 - Original full image:"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_original}"}},
+            {"type": "text", "text": "Image 2 - highlighted lesion area:"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_masked}"}}
+        ]
+    }]
+```
+
+**장점:**
+- 관심 영역 명확히 지정
+- 병변 경계 시각화
+- 진단 초점 유도
+
+**단점:**
+- 비용 증가 (이미지 2개)
+- 잘못된 분할 시 오진 유발 가능
+
+#### 11.4.3 방법 3: 원본 + 크롭된 병변
+
+```python
+# use_cropped=True일 때
+if use_cropped and cropped is not None:
+    base64_masked = self._encode_image(cropped)
+    second_image_desc = "cropped lesion region"
+```
+
+**장점:**
+- 병변에 완전히 집중
+- 세부 텍스처 분석 용이
+- 확대된 뷰 제공
+
+**단점:**
+- 주변 맥락 손실
+- 크롭 영역이 너무 작으면 정보 부족
+
+### 11.5 이미지 인코딩 방식
+
+```python
+def _encode_image(self, image: np.ndarray) -> str:
+    """numpy 배열을 base64 문자열로 변환"""
+    pil_image = Image.fromarray(image)
+    buffer = BytesIO()
+    pil_image.save(buffer, format="PNG")  # PNG 형식 사용
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+```
+
+| 포맷 | 선택 이유 |
+|------|-----------|
+| **PNG** | 손실 없는 압축, 의료 이미지에 적합 |
+| **Base64** | API 전송에 필요한 텍스트 인코딩 |
+
+### 11.6 JSON 응답 파싱
+
+```python
+# LLM 응답에서 JSON 추출
+try:
+    json_start = result_text.find('{')
+    json_end = result_text.rfind('}') + 1
+    if json_start != -1 and json_end > json_start:
+        result = json.loads(result_text[json_start:json_end])
+    else:
+        result = {"raw_response": result_text}
+except json.JSONDecodeError:
+    result = {"raw_response": result_text}
+```
+
+**파싱 전략:**
+1. 첫 번째 `{`와 마지막 `}` 사이 추출
+2. JSON 파싱 시도
+3. 실패 시 원본 텍스트 저장 (`raw_response`)
+
+---
+
+## 12. 메인 파이프라인 상세 분석 (main.py)
+
+### 12.1 커맨드라인 인터페이스
+
+```python
+parser.add_argument("--data-dir", default="Derm1M_v2_pretrain_ontology_sampled_100_images")
+parser.add_argument("--output-dir", default="outputs")
+parser.add_argument("--max-images", type=int, default=None)
+parser.add_argument("--no-diagnosis", action="store_true")
+parser.add_argument("--no-sam", action="store_true")
+parser.add_argument("--no-sam2", action="store_true")
+parser.add_argument("--no-medsam2", action="store_true")
+parser.add_argument("--no-visualizations", action="store_true")
+```
+
+**실행 예시:**
+```bash
+# 전체 파이프라인 실행
+python main.py --data-dir ./skin_images --output-dir ./results
+
+# SAM만 사용, 진단 제외
+python main.py --no-sam2 --no-medsam2 --no-diagnosis
+
+# 처음 10개 이미지만 테스트
+python main.py --max-images 10
+```
+
+### 12.2 입력 데이터 구조
+
+```
+Derm1M_v2_pretrain_ontology_sampled_100_images/
+├── 10730_4.png
+├── 10883_2.png
+├── 1587_2.png
+├── 20486_2.png
+├── 22269_2.png
+└── ... (100개 이미지)
+```
+
+**지원 포맷:**
+```python
+extensions = ('.jpg', '.jpeg', '.png', '.bmp')
+```
+
+### 12.3 단일 이미지 처리 흐름
+
+```python
+def process_single_image(image_path, sam_segmenter, sam2_segmenter,
+                         medsam2_segmenter, output_dir, save_visualizations):
+
+    # 1. 이미지 로드
+    image = load_image(str(image_path))  # RGB numpy array
+
+    # 2. 각 모델로 분할 수행
+    # SAM: 두 가지 전략 모두 실행
+    sam_results = sam_segmenter.segment_both_strategies(image)
+    # → {'center_focused': {...}, 'lesion_features': {...}}
+
+    # 3. 오버레이 및 크롭 생성
+    for strategy_name, seg_result in sam_results.items():
+        seg_result['overlay'] = apply_mask_to_image(
+            image, seg_result['mask'],
+            color=(255, 0, 0),  # 빨간색 (SAM)
+            alpha=0.4
+        )
+        seg_result['cropped'] = crop_masked_region(image, seg_result['mask'], padding=20)
+```
+
+**모델별 오버레이 색상:**
+
+| 모델 | RGB 색상 | 시각적 구분 |
+|------|----------|-------------|
+| SAM | (255, 0, 0) | 빨간색 |
+| SAM2 | (0, 255, 0) | 초록색 |
+| MedSAM2 | (0, 0, 255) | 파란색 |
+
+### 12.4 마스크 비교 메트릭
+
+```python
+# 모든 분할 결과 쌍에 대해 비교
+for i, key1 in enumerate(seg_keys):
+    for key2 in seg_keys[i+1:]:
+        metrics = compute_mask_metrics(mask1, mask2)
+        # → {'iou': 0.85, 'dice': 0.92, 'mask1_area': 1500, ...}
+```
+
+**계산 메트릭:**
+```python
+def compute_mask_metrics(mask1, mask2):
+    intersection = np.logical_and(mask1, mask2).sum()
+    union = np.logical_or(mask1, mask2).sum()
+
+    iou = intersection / union                    # Intersection over Union
+    dice = 2 * intersection / (mask1.sum() + mask2.sum())  # Dice coefficient
+
+    return {
+        'iou': iou,
+        'dice': dice,
+        'mask1_area': mask1.sum(),
+        'mask2_area': mask2.sum(),
+        'intersection': intersection,
+        'union': union
+    }
+```
+
+### 12.5 최고 분할 결과 선택 (진단용)
+
+```python
+# 진단에 사용할 분할 결과 선택
+best_seg = None
+best_score = 0
+
+for seg_name, seg_data in r['segmentations'].items():
+    if seg_data.get('score', 0) > best_score:
+        best_score = seg_data['score']
+        best_seg = seg_data
+
+# 가장 높은 confidence score를 가진 분할 결과 사용
+diagnosis_data.append({
+    'filename': r['filename'],
+    'original': r['original'],
+    'masked_overlay': best_seg.get('overlay'),
+    'cropped': best_seg.get('cropped')
+})
+```
+
+---
+
+## 13. 시각화 모듈 분석 (visualize.py)
+
+### 13.1 비교 그림 생성
+
+```python
+def create_comparison_figure(original, sam_mask, medsam_mask,
+                             sam_overlay, medsam_overlay,
+                             sam_score, medsam_score, ...):
+    """
+    2x3 그리드 비교 그림 생성
+
+    Row 1: Original | SAM Overlay | MedSAM2 Overlay
+    Row 2: Original | SAM Mask    | MedSAM2 Mask
+    """
+    fig = plt.figure(figsize=(16, 10))
+    gs = GridSpec(2, 3, figure=fig, hspace=0.3, wspace=0.2)
+```
+
+### 13.2 마스크 차이 시각화
+
+```python
+def visualize_mask_difference(mask1, mask2, labels=("SAM", "MedSAM2")):
+    """
+    두 마스크의 차이를 색상으로 시각화
+
+    - 녹색: mask1만 포함하는 영역
+    - 파란색: mask2만 포함하는 영역
+    - 노란색: 두 마스크 모두 포함하는 영역
+    """
+    only_mask1 = mask1 & ~mask2  # 녹색
+    only_mask2 = mask2 & ~mask1  # 파란색
+    both = mask1 & mask2         # 노란색
+```
+
+---
+
+## 14. 테스트 데이터 및 실험 설정
+
+### 14.1 테스트 데이터셋
+
+| 항목 | 값 |
+|------|-----|
+| **데이터셋 명** | Derm1M_v2_pretrain_ontology_sampled_100_images |
+| **이미지 수** | 100장 |
+| **형식** | PNG (주로) |
+| **출처** | Derm1M v2 (피부과 이미지 대규모 데이터셋) |
+| **내용** | 다양한 피부 질환 임상 사진 |
+
+### 14.2 실험 매트릭스
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                    실험 구성 매트릭스                        │
+├────────────────────────────────────────────────────────────┤
+│                                                            │
+│  모델 (3종)           전략 (2종)           진단 (3종)       │
+│  ┌─────────┐         ┌───────────────┐    ┌─────────────┐  │
+│  │   SAM   │    ×    │Center-focused│  × │Original only│  │
+│  │  SAM2   │         │Lesion-feature│    │With overlay │  │
+│  │MedSAM2  │         └───────────────┘    │With cropped │  │
+│  └─────────┘                              └─────────────┘  │
+│                                                            │
+│  = 3 × 2 = 6 분할 결과 per image                           │
+│  = 3 진단 방법 per image (최고 분할 결과 사용)              │
+│                                                            │
+└────────────────────────────────────────────────────────────┘
+```
+
+### 14.3 출력 파일 구조
+
+```
+outputs/
+├── checkpoints/                      # 다운로드된 모델 체크포인트
+│   ├── sam_vit_h_4b8939.pth         # SAM ViT-H (~2.5GB)
+│   ├── sam2.1_hiera_large.pt        # SAM2 Hiera-L (~900MB)
+│   └── MedSAM2_latest.pt            # MedSAM2 (~300MB)
+│
+├── visualizations/                   # 시각화 이미지
+│   ├── 10730_4_SAM_center_focused_overlay.png
+│   ├── 10730_4_SAM_center_focused_cropped.png
+│   ├── 10730_4_SAM_lesion_features_overlay.png
+│   ├── 10730_4_SAM2_center_focused_overlay.png
+│   ├── ... (모든 조합)
+│   └── 10730_4_full_comparison.png  # 전체 비교 그리드
+│
+├── diagnosis/                        # OpenAI 진단 결과
+│   ├── 10730_4_diagnosis.json
+│   ├── 10883_2_diagnosis.json
+│   ├── ...
+│   └── all_diagnosis_results.json   # 전체 결과 통합
+│
+├── segmentation_results.json         # 분할 결과 요약
+└── diagnosis_report.md               # 진단 비교 보고서
+```
+
+### 14.4 JSON 출력 형식 예시
+
+**segmentation_results.json:**
+```json
+[
+  {
+    "filename": "10730_4.png",
+    "path": "/path/to/10730_4.png",
+    "segmentations": {
+      "SAM_center_focused": {
+        "score": 0.987,
+        "method": "center_point"
+      },
+      "SAM_lesion_features": {
+        "score": 0.892,
+        "method": "feature_point_0"
+      },
+      "SAM2_center_focused": {
+        "score": 0.991,
+        "method": "center_box"
+      }
+    },
+    "mask_comparisons": {
+      "SAM_center_focused_vs_SAM2_center_focused": {
+        "iou": 0.856,
+        "dice": 0.923
+      }
+    }
+  }
+]
+```
+
+**진단 JSON 예시:**
+```json
+{
+  "original_only": {
+    "observed_features": {
+      "color": "Erythematous base with overlying white scale",
+      "shape": "Irregular, roughly circular",
+      "texture": "Scaly, raised plaques",
+      "borders": "Well-demarcated",
+      "size": "Approximately 3-4 cm diameter"
+    },
+    "possible_conditions": [
+      {"name": "Psoriasis", "confidence": "High",
+       "reasoning": "Classic silvery scale on erythematous base"},
+      {"name": "Nummular eczema", "confidence": "Medium",
+       "reasoning": "Coin-shaped lesion, but scale pattern differs"},
+      {"name": "Tinea corporis", "confidence": "Low",
+       "reasoning": "Would expect more central clearing"}
+    ],
+    "method": "original_only",
+    "tokens_used": 1523
+  },
+  "with_overlay": {
+    "segmentation_benefits": "The highlighted region clearly delineates
+     the lesion boundary, confirming well-demarcated borders typical of psoriasis",
+    ...
+  }
+}
+```
+
+---
+
+## 15. 비용 및 성능 분석
+
+### 15.1 API 비용 추정
+
+| 진단 방법 | 이미지 수 | 토큰 (입력) | 토큰 (출력) | 예상 비용/이미지 |
+|-----------|-----------|------------|------------|-----------------|
+| Original only | 1장 | ~1000 | ~500 | ~$0.02 |
+| With overlay | 2장 | ~2000 | ~600 | ~$0.04 |
+| With cropped | 2장 | ~1800 | ~600 | ~$0.035 |
+| **전체 (3방법)** | **5장** | **~4800** | **~1700** | **~$0.10** |
+
+**100장 이미지 전체 처리 시:** 약 $10
+
+### 15.2 처리 시간 추정
+
+| 단계 | 시간/이미지 | 비고 |
+|------|------------|------|
+| SAM 분할 | ~3초 | GPU 기준 |
+| SAM2 분할 | ~2초 | 더 효율적 |
+| MedSAM2 분할 | ~1.5초 | Tiny 모델 |
+| OpenAI API 호출 | ~5-10초 | 네트워크 지연 포함 |
+| 시각화 저장 | ~1초 | I/O bound |
+| **총계** | **~15-20초** | GPU + API |
+
+---
+
+## 16. 결론 및 향후 계획
+
+### 16.1 현재 파이프라인 강점
+
+1. **모듈화된 설계**: 각 컴포넌트 독립적 테스트 가능
+2. **다중 모델 비교**: SAM/SAM2/MedSAM2 동시 평가
+3. **다중 전략 비교**: Center vs Feature-based 전략 평가
+4. **LLM 기반 검증**: GPT-4o로 분할 품질의 임상적 유용성 평가
+5. **포괄적인 시각화**: 모든 결과를 시각적으로 비교
+
+### 16.2 개선 필요 사항
+
+| 영역 | 현재 문제 | 개선 방안 |
+|------|-----------|-----------|
+| Feature Detection | 성능 저조 | Saliency 기반 접근 |
+| 진단 비용 | 비쌈 ($0.10/이미지) | 로컬 VLM 도입 (LLaVA-Med) |
+| 처리 속도 | 느림 (~20초/이미지) | 배치 처리, 병렬화 |
+| 평가 메트릭 | 정성적 | Ground Truth 도입, 정량 평가 |
+
+### 16.3 향후 연구 방향
+
+1. **Ground Truth 마스크 수집**: 전문가 라벨링으로 정량 평가
+2. **다중 프롬프트 실험**: 다양한 LLM 프롬프트로 진단 품질 비교
+3. **Fine-tuning**: MedSAM2를 피부 질환에 특화하여 추가 학습
+4. **온라인 서비스화**: Gradio/Streamlit 웹 인터페이스 구축
+
+---
+
 *보고서 작성일: 2024*
-*작성: SAM Masking Pipeline Analysis*
+*작성: SAM 피부 병변 분할 파이프라인 분석*
