@@ -840,11 +840,13 @@ def compute_mask_metrics(mask1, mask2):
 # 진단에 사용할 분할 결과 선택
 best_seg = None
 best_score = 0
+best_seg_name = None  # 어떤 모델/전략인지 추적
 
 for seg_name, seg_data in r['segmentations'].items():
     if seg_data.get('score', 0) > best_score:
         best_score = seg_data['score']
         best_seg = seg_data
+        best_seg_name = seg_name  # 예: "SAM2_center_focused"
 
 # 가장 높은 confidence score를 가진 분할 결과 사용
 diagnosis_data.append({
@@ -852,6 +854,56 @@ diagnosis_data.append({
     'original': r['original'],
     'masked_overlay': best_seg.get('overlay'),
     'cropped': best_seg.get('cropped')
+})
+```
+
+#### 12.5.1 진단에 사용되는 이미지의 출처
+
+**현재 동작 방식:**
+OpenAI 진단에 전송되는 마스크 오버레이와 크롭 이미지는 **모든 분할 결과 중 가장 높은 confidence score를 가진 것**이 자동 선택됩니다.
+
+```
+분할 결과 후보 (예시):
+┌─────────────────────────────┬─────────┬────────────────┐
+│ seg_name                    │ score   │ method         │
+├─────────────────────────────┼─────────┼────────────────┤
+│ SAM_center_focused          │ 0.987   │ center_point   │
+│ SAM_lesion_features         │ 0.892   │ feature_point_0│
+│ SAM2_center_focused         │ 0.991   │ center_box     │  ← 최고 점수
+│ SAM2_lesion_features        │ 0.876   │ feature_box    │
+│ MedSAM2_center_focused      │ 0.945   │ center_point   │
+│ MedSAM2_lesion_features     │ 0.823   │ feature_point_1│
+└─────────────────────────────┴─────────┴────────────────┘
+
+→ "SAM2_center_focused" (score=0.991)가 진단에 사용됨
+```
+
+**선택 기준:**
+| 기준 | 설명 |
+|------|------|
+| **선택 메트릭** | SAM/SAM2/MedSAM2 모델이 반환하는 confidence score |
+| **범위** | 모든 모델 × 모든 전략 중에서 최고 선택 |
+| **일반적 결과** | center_focused 방법이 더 높은 점수를 받는 경향 |
+
+**주요 관찰:**
+- **Center-focused 전략**이 대부분의 경우 더 높은 confidence score를 받음
+- 이유: 임상 사진에서 병변이 중앙에 위치 → SAM이 명확한 객체 인식 가능
+- **Lesion-features 전략**은 특징 탐지 노이즈로 인해 잘못된 포인트 선택 → 낮은 점수
+
+**⚠️ 현재 제한사항:**
+현재 코드는 어떤 모델/방법이 선택되었는지를 **진단 결과에 기록하지 않음**.
+추적이 필요하면 아래와 같이 수정 필요:
+
+```python
+# 개선된 코드 (제안)
+diagnosis_data.append({
+    'filename': r['filename'],
+    'original': r['original'],
+    'masked_overlay': best_seg.get('overlay'),
+    'cropped': best_seg.get('cropped'),
+    'segmentation_source': best_seg_name,     # "SAM2_center_focused"
+    'segmentation_score': best_score,          # 0.991
+    'segmentation_method': best_seg.get('method')  # "center_box"
 })
 ```
 
