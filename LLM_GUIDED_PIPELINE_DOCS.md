@@ -388,7 +388,7 @@ results = run_batch_pipeline(
 # 기본 실행 (샘플 데이터셋에서 5개 이미지 자동 처리)
 python llm_guided_pipeline.py
 
-# 전체 이미지 처리 (96개)
+# 전체 이미지 처리 (100개)
 python llm_guided_pipeline.py --max-images 0
 
 # 특정 개수만 처리
@@ -428,7 +428,7 @@ Derm1M_v2_pretrain_ontology_sampled_100_images/
 ├── public/     # 공개 데이터셋
 ├── pubmed/     # PubMed 논문 이미지
 └── youtube/    # YouTube 캡처
-총 96개 피부 질환 이미지
+총 100개 피부 질환 이미지
 ```
 
 ---
