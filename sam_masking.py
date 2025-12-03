@@ -757,13 +757,46 @@ class MedSAM2Segmenter:
         print(f"  Checkpoint: {checkpoint_path}")
 
         try:
+            # Initialize Hydra before loading model
+            from hydra import initialize_config_dir
+            from hydra.core.global_hydra import GlobalHydra
+            import sam2
+
+            # Clear any existing Hydra instance
+            if GlobalHydra.instance().is_initialized():
+                GlobalHydra.instance().clear()
+
+            # Find SAM2 config directory
+            sam2_dir = Path(sam2.__file__).parent
+            config_dir = None
+
+            # Try different config locations
+            possible_config_dirs = [
+                sam2_dir / "configs" / "sam2.1",
+                sam2_dir / "sam2_configs",
+                sam2_dir / "configs",
+            ]
+
+            for possible_dir in possible_config_dirs:
+                if possible_dir.exists():
+                    config_dir = possible_dir
+                    break
+
+            if config_dir is None:
+                raise ImportError(f"Cannot find SAM2 config directory in {sam2_dir}")
+
+            # Determine which config to use
             if config_path:
                 print(f"  Config: {config_path}")
-                self.model = build_sam2(str(config_path), str(checkpoint_path), device=self.device)
+                config_name = Path(config_path).name
             else:
-                # Use default SAM2 config (will work but may not be optimal)
+                # Use sam2.1_hiera_t.yaml for MedSAM2 (tiny model)
                 print("  Config: Using default sam2.1_hiera_t.yaml")
-                self.model = build_sam2("sam2.1_hiera_t.yaml", str(checkpoint_path), device=self.device)
+                config_name = "sam2.1_hiera_t.yaml"
+
+            # Initialize Hydra with the config directory
+            with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+                self.model = build_sam2(config_name, str(checkpoint_path), device=self.device)
 
             self.predictor = SAM2ImagePredictor(self.model)
             print("MedSAM2 model loaded successfully!")
