@@ -881,28 +881,69 @@ def _print_summary(results: List[Dict]):
         print(f"총 병변: {total_lesions} (평균: {avg_lesions:.1f})")
 
 
+# 기본 데이터 디렉토리 (프로젝트 내 샘플 이미지)
+DEFAULT_DATA_DIR = "Derm1M_v2_pretrain_ontology_sampled_100_images"
+DEFAULT_OUTPUT_DIR = "outputs/llm_guided"
+
+
+def find_data_directory() -> Optional[str]:
+    """
+    데이터 디렉토리 자동 탐지
+
+    탐색 순서:
+    1. 현재 디렉토리의 DEFAULT_DATA_DIR
+    2. 스크립트 위치 기준 DEFAULT_DATA_DIR
+    """
+    # 현재 디렉토리에서 찾기
+    if Path(DEFAULT_DATA_DIR).exists():
+        return DEFAULT_DATA_DIR
+
+    # 스크립트 위치 기준으로 찾기
+    script_dir = Path(__file__).parent
+    data_path = script_dir / DEFAULT_DATA_DIR
+    if data_path.exists():
+        return str(data_path)
+
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="LLM-Guided SAM Pipeline for Skin Disease Diagnosis"
+        description="LLM-Guided SAM Pipeline for Skin Disease Diagnosis",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+예시:
+  # 기본 실행 (샘플 이미지 5개 처리)
+  python llm_guided_pipeline.py
+
+  # 전체 이미지 처리
+  python llm_guided_pipeline.py --max-images 0
+
+  # 특정 이미지 처리
+  python llm_guided_pipeline.py --single-image path/to/image.png
+
+  # MedSAM2 사용
+  python llm_guided_pipeline.py --segmenter medsam2 --max-images 10
+        """
     )
 
     parser.add_argument(
         "--data-dir",
         type=str,
-        default="Derm1M_v2_pretrain_ontology_sampled_100_images",
-        help="이미지 디렉토리 경로"
+        default=None,
+        help=f"이미지 디렉토리 경로 (기본값: {DEFAULT_DATA_DIR})"
     )
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="outputs/llm_guided",
+        default=DEFAULT_OUTPUT_DIR,
         help="결과 저장 디렉토리"
     )
     parser.add_argument(
         "--max-images",
         type=int,
-        default=None,
-        help="최대 처리 이미지 수"
+        default=5,
+        help="최대 처리 이미지 수 (기본값: 5, 0=전체)"
     )
     parser.add_argument(
         "--segmenter",
@@ -924,6 +965,10 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # max_images=0이면 전체 처리
+    if args.max_images == 0:
+        args.max_images = None
 
     # 단일 이미지 모드
     if args.single_image:
@@ -969,12 +1014,31 @@ def main():
 
     else:
         # 배치 모드
-        if not Path(args.data_dir).exists():
-            print(f"디렉토리를 찾을 수 없음: {args.data_dir}")
+        # 데이터 디렉토리 자동 탐지
+        data_dir = args.data_dir
+        if data_dir is None:
+            data_dir = find_data_directory()
+            if data_dir is None:
+                print(f"데이터 디렉토리를 찾을 수 없습니다.")
+                print(f"다음 경로에 이미지 폴더가 있어야 합니다: {DEFAULT_DATA_DIR}")
+                print(f"또는 --data-dir 옵션으로 경로를 지정하세요.")
+                sys.exit(1)
+            print(f"데이터 디렉토리 자동 탐지: {data_dir}")
+
+        if not Path(data_dir).exists():
+            print(f"디렉토리를 찾을 수 없음: {data_dir}")
             sys.exit(1)
 
+        # 이미지 수 확인
+        image_count = len(get_image_files(data_dir))
+        print(f"\n발견된 이미지: {image_count}개")
+        if args.max_images:
+            print(f"처리할 이미지: {min(args.max_images, image_count)}개")
+        else:
+            print(f"처리할 이미지: 전체 ({image_count}개)")
+
         run_batch_pipeline(
-            data_dir=args.data_dir,
+            data_dir=data_dir,
             output_dir=args.output_dir,
             max_images=args.max_images,
             segmenter_type=args.segmenter,
